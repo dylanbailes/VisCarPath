@@ -1,220 +1,101 @@
-# VisCarPath - Autonomous Car Navigation with AprilTags
 
-Autonomous navigation system for routing a car to AprilTag targets using OAK-D Lite stereo camera, with ground plane detection, obstacle avoidance, Kalman filtering, and MPC control.
+## Testing and Debugging
 
-## Architecture
+The system includes comprehensive test suites for each module. Run tests to verify functionality at each level.
 
-The system consists of four main modules:
-
-1. **AprilTag Detection** (`apriltag_detection.py`)
-   - OAK-D Lite RGB + Depth pipeline
-   - AprilTag recognition and pose estimation
-   - Ground-level tag filtering
-
-2. **Ground & Obstacle Detection** (`ground_obstacle_detection.py`)
-   - RANSAC-based ground plane detection
-   - Obstacle detection via height analysis
-   - Path planning with obstacle avoidance
-
-3. **Kalman Filter** (`kalman_filter.py`)
-   - Extended Kalman Filter for state estimation
-   - Vehicle position, velocity, and heading estimation
-   - Multi-tag measurement fusion
-
-4. **MPC Controller** (`mpc_controller.py`)
-   - Model Predictive Control for path following
-   - Bicycle model vehicle dynamics
-   - Obstacle-aware trajectory optimization
-
-5. **Main Navigation** (`main_navigation.py`)
-   - Integrates all components
-   - Real-time control loop
-   - Visualization and diagnostics
-
-## Installation
+### Running Individual Test Suites
 
 ```bash
-# Install dependencies
-pip install depthai apriltag opencv-python numpy cvxpy
+# Test AprilTag detection module
+python test_apriltag.py
 
-# Optional: for visualization
-pip install matplotlib
+# Test ground plane and obstacle detection
+python test_ground_obstacle.py
+
+# Test Kalman filter state estimation
+python test_kalman_filter.py
+
+# Test MPC controller
+python test_mpc_controller.py
 ```
 
-## Usage
+### Test Suite Descriptions
 
-### Basic Navigation (with visualization)
+#### AprilTag Detection Tests (test_apriltag.py)
+1. **Initialization** - Verify detector creation with default/custom parameters
+2. **Camera Intrinsics** - Test setting focal length and principal point
+3. **Synthetic Detection** - Detect tags in test images (requires test_tag.png)
+4. **Ground Filtering** - Filter ground-level vs wall-mounted tags
+5. **Pose Estimation** - Verify PnP accuracy with known geometry
+6. **Bearing Calculation** - Test angle calculations for various positions
+7. **OAK-D Pipeline** - Verify pipeline structure (without hardware)
+
+#### Ground & Obstacle Detection Tests (test_ground_obstacle.py)
+1. **Ground Detector Init** - Verify RANSAC parameters
+2. **Synthetic Ground Detection** - Detect plane in synthetic point cloud
+3. **Obstacle Detector Init** - Verify height threshold settings
+4. **Synthetic Obstacle Detection** - Detect obstacles in depth data
+5. **Path Planner Init** - Verify robot width and clearance settings
+6. **Cost Map Creation** - Generate navigation cost maps
+7. **Path Segment Creation** - Create and validate path segments
+8. **Pipeline Structure** - Test integrated pipeline setup
+
+#### Kalman Filter Tests (test_kalman_filter.py)
+1. **Vehicle State Creation** - Create and convert state objects
+2. **EKF Initialization** - Set up filter with custom initial state
+3. **EKF Prediction** - Test bicycle model prediction
+4. **EKF Update** - Verify measurement correction
+5. **Angle Normalization** - Test angle wrapping to [-pi, pi]
+6. **Tag Fusion Init** - Initialize measurement fusion
+7. **Tag Measurement Processing** - Convert tag detections to measurements
+8. **Multiple Tag Fusion** - Combine measurements from multiple tags
+9. **EKF Reset** - Reset filter to initial conditions
+
+#### MPC Controller Tests (test_mpc_controller.py)
+1. **MPC Config** - Create configuration with constraints
+2. **Vehicle Dynamics** - Test bicycle model kinematics
+3. **Steering Kinematics** - Verify turning radius calculations
+4. **MPC Controller Init** - Initialize optimization controller
+5. **Dynamics Linearization** - Compute Jacobian matrices
+6. **Reference Trajectory** - Generate path references
+7. **Simple MPC Solve** - Optimize control inputs (no obstacles)
+8. **MPC with Obstacles** - Test obstacle avoidance
+9. **Path Following Controller** - High-level control interface
+10. **Fallback Control** - PD control when MPC fails
+
+### Running All Tests
 
 ```bash
-python main_navigation.py
+# Run all test suites sequentially
+python test_apriltag.py && python test_ground_obstacle.py && \
+python test_kalman_filter.py && python test_mpc_controller.py
 ```
 
-### Navigate to Specific Tag
+### Debugging Tips
 
-```bash
-python main_navigation.py --target 0
-```
+**AprilTag Detection Issues:**
+- If synthetic detection fails, create a test image with an AprilTag
+- Check camera intrinsics match your OAK-D calibration
+- Adjust quad_decimate for faster/slower detection
 
-### Without Visualization (headless mode)
+**Ground Plane Detection Issues:**
+- Increase min_inliers if too many false positives
+- Decrease ransac_threshold for stricter plane fitting
+- Ensure depth data has sufficient ground points visible
 
-```bash
-python main_navigation.py --no-display
-```
+**Kalman Filter Issues:**
+- Increase process_noise if filter is too slow to track
+- Decrease measurement_noise to trust measurements more
+- Check tag map contains correct world positions
 
-### Command Line Options
+**MPC Controller Issues:**
+- Reduce horizon if solve time is too long
+- Increase obstacle_safety_margin for more conservative navigation
+- Check CVXPY solver installation: pip install cvxpy osqp
 
-```
---target TAG_ID       Target AprilTag ID to navigate to
---robot-width WIDTH   Robot width in meters (default: 0.5)
---no-display          Disable visualization
-```
+### Creating Test Data
 
-## Module Details
-
-### AprilTag Detection
-
-```python
-from apriltag_detection import OakDAprilTagPipeline
-
-pipeline = OakDAprilTagPipeline(tag_family="tag36h11")
-pipeline.start()
-
-rgb, depth, ts = pipeline.get_frame_data()
-tags = pipeline.detect_tags_in_frame(rgb, depth)
-
-for tag in tags:
-    print(f"Tag {tag.tag_id}: distance={tag.distance:.2f}m, bearing={tag.bearing:.2f}rad")
-
-pipeline.stop()
-```
-
-### Ground Plane & Obstacle Detection
-
-```python
-from ground_obstacle_detection import GroundAndObstaclePipeline
-
-detector = GroundAndObstaclePipeline(robot_width=0.5)
-detector.set_camera_intrinsics(fx, fy, cx, cy)
-
-result = detector.process_frame(depth_map, tag_detections, image_shape)
-
-print(f"Ground confidence: {result['ground_plane'].confidence}")
-print(f"Obstacles detected: {len(result['obstacles'])}")
-```
-
-### Kalman Filter State Estimation
-
-```python
-from kalman_filter import ExtendedKalmanFilter, VehicleState, TagMeasurementFusion
-
-ekf = ExtendedKalmanFilter(initial_state=VehicleState(0, 0, 0, 0, 0))
-fusion = TagMeasurementFusion(ekf)
-
-# Add known tag positions
-fusion.add_tag_to_map(tag_id=0, x=5.0, y=10.0)
-
-# Update with detections
-fusion.update_ekf_with_tags(tag_detections)
-
-# Get estimated state
-state = ekf.get_state()
-print(f"Position: ({state.x}, {state.y}), Heading: {state.theta}")
-```
-
-### MPC Control
-
-```python
-from mpc_controller import PathFollowingController, MPCConfig
-
-config = MPCConfig(horizon=10, dt=0.1, max_velocity=1.5)
-controller = PathFollowingController(config)
-
-controller.update_state(current_state_array)
-acceleration, steering_rate = controller.compute_control(path_segments, obstacles)
-```
-
-## System Flow
-
-```
-┌─────────────────┐
-│   OAK-D Lite    │
-│  RGB + Depth    │
-└────────┬────────┘
-         │
-         ▼
-┌─────────────────┐
-│  AprilTag Detect│
-│  + Pose Est     │
-└────────┬────────┘
-         │
-         ▼
-┌─────────────────┐
-│ Ground Plane    │
-│ + Obstacle Det  │
-└────────┬────────┘
-         │
-         ▼
-┌─────────────────┐
-│  Path Planning  │
-│  (collision-free)│
-└────────┬────────┘
-         │
-         ▼
-┌─────────────────┐
-│ Kalman Filter   │
-│ State Estimate  │
-└────────┬────────┘
-         │
-         ▼
-┌─────────────────┐
-│ MPC Controller  │
-│ Optimal Control │
-└────────┬────────┘
-         │
-         ▼
-┌─────────────────┐
-│ Vehicle Control │
-│ (accel, steer)  │
-└─────────────────┘
-```
-
-## Navigation States
-
-- `IDLE` - System initialized, not running
-- `DETECTING_TAGS` - Searching for AprilTags
-- `PLANNING_PATH` - Computing path to target
-- `NAVIGATING` - Actively following path
-- `OBSTRUCTED` - Obstacle detected, slowing/stopping
-- `TARGET_REACHED` - Arrived at target tag
-- `ERROR` - System error
-
-## Requirements
-
-- OAK-D Lite camera
-- AprilTag markers (tag36h11 family recommended)
-- Python 3.8+
-- Dependencies listed above
-
-## Configuration
-
-Key parameters to tune:
-
-- `robot_width`: Your vehicle's width (for collision avoidance)
-- `max_velocity`: Maximum forward speed (m/s)
-- `obstacle_safety_margin`: Clearance from obstacles (m)
-- `camera_pitch`: Camera mounting angle (radians)
-
-## Notes
-
-1. **Camera Mounting**: For best results, mount the OAK-D Lite with a downward pitch of ~15-20 degrees to see both the ground and distant tags.
-
-2. **AprilTag Placement**: Place tags flat on the ground. The system filters for ground-level tags based on orientation.
-
-3. **Lighting**: AprilTag detection works best in good lighting conditions.
-
-4. **Initial Position**: The system starts at origin (0,0). For accurate localization, either:
-   - Pre-populate the tag map with known positions
-   - Start near a known tag for initial localization
+For testing with real AprilTags, generate tags using the AprilTag tools or download pre-generated tags from the AprilTag GitHub wiki.
 
 ## License
 
