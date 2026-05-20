@@ -113,17 +113,43 @@ For testing with real AprilTags:
 To test the full navigation pipeline:
 
 ```bash
-# Run main navigation (requires OAK-D hardware)
-python main_navigation.py --target 0
+# Run main navigation (works with or without OAK-D hardware)
+python main_navigation.py --target 0 --no-display
 ```
 
 This will:
-1. Initialize OAK-D camera
+1. Initialize OAK-D camera (or run in simulation mode if no hardware)
 2. Detect AprilTags and estimate poses
 3. Build ground/obstacle map
 4. Plan path to target tag
 5. Run Kalman filter for state estimation
 6. Execute MPC control commands
+
+**Expected Output:**
+- System initializes successfully
+- Runs in "detecting_tags" state (waiting for tags in simulation mode)
+- Outputs diagnostic information every 100ms
+- Press Ctrl+C to stop
+
+**With GUI (requires display):**
+```bash
+python main_navigation.py --target 0
+```
+
+**Without OAK-D Hardware:**
+The system automatically detects if OAK-D is available and runs in simulation mode if not connected. This allows testing the logic without physical hardware.
+
+**With OAK-D Hardware:**
+Connect your OAK-D Lite via USB and run:
+```bash
+python main_navigation.py --target 0
+```
+
+The system will:
+- Connect to the OAK-D device
+- Stream RGB and depth frames
+- Perform real-time AprilTag detection
+- Navigate toward detected ground tags
 
 ## License
 
