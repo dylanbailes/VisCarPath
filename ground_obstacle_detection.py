@@ -388,7 +388,7 @@ class PathPlanner:
             
             # Draw cost gradient around obstacle
             y, x = np.ogrid[:height, :width]
-            dist_from_obs = np.sqrt((x - obs.center[0])**2 + **(y - obs.center[1])2)
+            dist_from_obs = np.sqrt((x - obs.center[0])**2 + (y - obs.center[1])**2)
             
             # Cost increases near obstacle
             obstacle_cost = np.exp(-dist_from_obs / (influence_radius / 2))
