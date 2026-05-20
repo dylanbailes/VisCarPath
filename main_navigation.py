@@ -396,23 +396,33 @@ class AutonomousNavigator:
                 cv2.putText(display, f"Steer: {self.current_command.steering_rate:.3f} rad/s",
                            (10, cmd_y + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
                 
-                # Display
-                cv2.imshow("Autonomous Navigation", display)
-                
-                # Handle keyboard input
-                key = cv2.waitKey(1) & 0xFF
-                if key == ord('q'):
+                # Display (skip if no GUI support available)
+                try:
+                    cv2.imshow("Autonomous Navigation", display)
+                    
+                    # Handle keyboard input
+                    key = cv2.waitKey(1) & 0xFF
+                    if key == ord('q'):
+                        break
+                    elif key == ord('t'):
+                        # Set target to first detected tag
+                        if ground_tags:
+                            self.set_target_tag(ground_tags[0].tag_id)
+                except cv2.error as e:
+                    print(f"GUI not available: {e}")
+                    print("Running in headless mode. Press Ctrl+C to stop.")
+                    # Run without visualization for a few iterations
+                    time.sleep(5)
                     break
-                elif key == ord('t'):
-                    # Set target to first detected tag
-                    if ground_tags:
-                        self.set_target_tag(ground_tags[0].tag_id)
                         
         except KeyboardInterrupt:
             print("\nInterrupted by user")
         finally:
             self.stop()
-            cv2.destroyAllWindows()
+            try:
+                cv2.destroyAllWindows()
+            except:
+                pass  # Ignore GUI errors in headless mode
 
 
 def main():

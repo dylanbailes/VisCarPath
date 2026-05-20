@@ -13,14 +13,6 @@ from typing import Optional, List
 DEPTHAI_AVAILABLE = False
 dai = None
 
-# Do not attempt to import depthai as it causes bus errors
-# if DEPTHAI_AVAILABLE:
-#     try:
-#         import depthai as dai
-#     except Exception:
-#         DEPTHAI_AVAILABLE = False
-#         dai = None
-
 
 @dataclass
 class AprilTagDetection:
@@ -214,6 +206,11 @@ class OakDAprilTagPipeline:
         
     def setup_oakd_pipeline(self):
         """Configure OAK-D Lite stereo depth + RGB pipeline"""
+        if not DEPTHAI_AVAILABLE:
+            print("DepthAI not available. Using simulated camera feed.")
+            self.pipeline = None
+            return None
+            
         self.pipeline = dai.Pipeline()
         
         # Define sources and outputs
@@ -248,8 +245,15 @@ class OakDAprilTagPipeline:
     
     def start(self):
         """Start OAK-D device and pipeline"""
+        if not DEPTHAI_AVAILABLE:
+            print("Running in simulation mode without OAK-D hardware.")
+            return
+            
         if self.pipeline is None:
             self.setup_oakd_pipeline()
+        
+        if self.pipeline is None:
+            return
         
         self.device = dai.Device(self.pipeline)
         self.q_rgb = self.device.getOutputQueue(name="rgb", maxSize=4, blocking=False)
@@ -275,6 +279,10 @@ class OakDAprilTagPipeline:
         Returns:
             Tuple of (rgb_frame, depth_frame, timestamp) or (None, None, None) if unavailable
         """
+        if not DEPTHAI_AVAILABLE or self.q_rgb is None or self.q_depth is None:
+            # Return simulated data in simulation mode
+            return self._get_simulated_frame()
+            
         rgb_packet = self.q_rgb.tryGet()
         depth_packet = self.q_depth.tryGet()
         
@@ -289,6 +297,14 @@ class OakDAprilTagPipeline:
             return rgb_frame, depth_frame, rgb_packet.getTimestampDevice()
         
         return None, None, None
+    
+    def _get_simulated_frame(self):
+        """Generate simulated frame data for testing without hardware"""
+        # Create a blank RGB image
+        rgb_frame = np.zeros((720, 1280, 3), dtype=np.uint8)
+        # Create a blank depth image (all zeros = no depth)
+        depth_frame = np.zeros((720, 1280), dtype=np.uint16)
+        return rgb_frame, depth_frame, 0.0
     
     def detect_tags_in_frame(self, rgb_frame: np.ndarray, 
                             depth_frame: np.ndarray) -> List[AprilTagDetection]:
