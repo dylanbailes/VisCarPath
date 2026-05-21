@@ -6,7 +6,7 @@
 Copy and paste this command to install all required dependencies:
 
 ```bash
-pip install opencv-python>=4.5.0 apriltag>=3.0.0 depthai<3.0.0 numpy>=1.20.0 scipy>=1.7.0 cvxpy>=1.0.0 osqp>=0.6.0
+pip install opencv-python>=4.5.0 apriltag depthai<3.0.0 numpy>=1.20.0 scipy>=1.7.0 cvxpy>=1.0.0 osqp>=0.6.0
 ```
 
 **Important Notes:**

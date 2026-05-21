@@ -5,13 +5,13 @@ Detects AprilTags and estimates their pose relative to the camera
 
 import cv2
 import numpy as np
-from apriltag import Detector, DetectorOptions
+import depthai as dai
+from pupil_apriltags import Detector
 from dataclasses import dataclass
 from typing import Optional, List
 
 # Completely disable depthai to avoid bus errors on this system
-DEPTHAI_AVAILABLE = False
-dai = None
+DEPTHAI_AVAILABLE = True
 
 
 @dataclass
@@ -43,20 +43,20 @@ class AprilTagDetector:
             quad_decimate: Detection resolution (higher = faster but less accurate)
             quad_sigma: Gaussian blur sigma for detection
         """
-        # Create DetectorOptions object first - use nthreads=1 to avoid bus errors
-        if tag_family == "tag36h11":
-            options = DetectorOptions(families='tag36h11', nthreads=1)
-        elif tag_family == "tag16h5":
-            options = DetectorOptions(families='tag16h5', nthreads=1)
-        else:
-            options = DetectorOptions(families='tag36h11', nthreads=1)
+        # Validate tag family, fallback to tag36h11 if invalid
+        valid_families = ["tag36h11", "tag16h5", "tag25h9", "tagStandard41h12", "tagCustom48h12"]
+        if tag_family not in valid_families:
+            print(f"Warning: Unknown tag family '{tag_family}'. Falling back to 'tag36h11'.")
+            tag_family = "tag36h11"
         
-        # Set additional options
-        options.quad_decimate = quad_decimate
-        options.quad_sigma = quad_sigma
-        
-        # Pass options object to Detector
-        self.detector = Detector(options)
+        # pupil_apriltags takes parameters directly in the Detector constructor
+        # We use nthreads=1 to avoid potential bus errors on some systems
+        self.detector = Detector(
+            families=tag_family,
+            nthreads=1,
+            quad_decimate=quad_decimate,
+            quad_sigma=quad_sigma
+        )
         self.tag_family = tag_family
         
         # Camera intrinsics (will be updated from OAK-D)
@@ -67,6 +67,7 @@ class AprilTagDetector:
         
         # Tag size in meters (should be configured based on actual tags)
         self.tag_size = 0.16  # 16cm standard AprilTag
+
         
     def set_camera_intrinsics(self, fx: float, fy: float, cx: float, cy: float):
         """Set camera intrinsics from OAK-D calibration"""
@@ -213,31 +214,42 @@ class OakDAprilTagPipeline:
             
         self.pipeline = dai.Pipeline()
         
-        # Define sources and outputs
+        # 1. Define sources (RGB + 2 Mono cameras for depth)
         cam_rgb = self.pipeline.create(dai.node.ColorCamera)
+        mono_left = self.pipeline.create(dai.node.MonoCamera)
+        mono_right = self.pipeline.create(dai.node.MonoCamera)
         stereo = self.pipeline.create(dai.node.StereoDepth)
         
-        # RGB camera configuration
+        # 2. RGB camera configuration
         cam_rgb.setPreviewSize(1280, 720)
         cam_rgb.setResolution(dai.ColorCameraProperties.SensorResolution.THE_1080_P)
         cam_rgb.setInterleaved(False)
         cam_rgb.setColorOrder(dai.ColorCameraProperties.ColorOrder.RGB)
         cam_rgb.setFps(30)
         
-        # Stereo depth configuration
-        stereo.setConfidenceThreshold(200)
-        stereo.setRectifyEdgeFillColor(0)  # Black fill for invalid pixels
+        # 3. Mono cameras configuration (Required for StereoDepth)
+        mono_left.setResolution(dai.MonoCameraProperties.SensorResolution.THE_400_P)
+        mono_left.setBoardSocket(dai.CameraBoardSocket.LEFT)
+        
+        mono_right.setResolution(dai.MonoCameraProperties.SensorResolution.THE_400_P)
+        mono_right.setBoardSocket(dai.CameraBoardSocket.RIGHT)
+        
+        # 4. Stereo depth configuration
+        stereo.setDefaultProfilePreset(dai.node.StereoDepth.PresetMode.HIGH_ACCURACY)
+        stereo.setDepthAlign(dai.CameraBoardSocket.RGB)  # Aligns depth map to the RGB camera!
         stereo.setOutputSize(1280, 720)
         
-        # Link nodes
-        cam_rgb.preview.link(stereo.inputLeft)  # Use RGB as left input for aligned depth
+        # 5. Link Mono cameras to Stereo Depth
+        mono_left.out.link(stereo.left)
+        mono_right.out.link(stereo.right)
         
-        # Create outputs
+        # 6. Create outputs to send to PC
         xout_rgb = self.pipeline.create(dai.node.XLinkOut)
         xout_depth = self.pipeline.create(dai.node.XLinkOut)
         xout_rgb.setStreamName("rgb")
         xout_depth.setStreamName("depth")
         
+        # 7. Link camera previews to outputs
         cam_rgb.preview.link(xout_rgb.input)
         stereo.depth.link(xout_depth.input)
         
@@ -255,7 +267,7 @@ class OakDAprilTagPipeline:
         if self.pipeline is None:
             return
         
-        self.device = dai.Device(self.pipeline)
+        self.device = dai.Device(self.pipeline, usb2Mode=True)
         self.q_rgb = self.device.getOutputQueue(name="rgb", maxSize=4, blocking=False)
         self.q_depth = self.device.getOutputQueue(name="depth", maxSize=4, blocking=False)
         

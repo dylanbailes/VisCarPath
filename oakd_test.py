@@ -19,7 +19,10 @@ cam_rgb.preview.link(xout_rgb.input)
 
 # 5. Connect to the device and run the pipeline
 print("Searching for OAK-D Lite...")
-with dai.Device(pipeline) as device:
+
+# NOTE: usb2Mode=True is highly recommended for Windows to prevent 
+# "io error" disconnects caused by USB 3.0 power handshake issues.
+with dai.Device(pipeline, usb2Mode=True) as device:
     print(f"Successfully connected! Device MxId: {device.getMxId()}")
     print("Press 'q' in the video window to quit.")
     
