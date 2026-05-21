@@ -12,8 +12,8 @@ print(f"Created test image: {img.shape}")
 
 # Test apriltag
 try:
-    import apriltag
-    detector = apriltag.Detector(apriltag.DetectorOptions(families='tag36h11'))
+    from apriltag import Detector, DetectorOptions
+    detector = Detector(DetectorOptions(families='tag36h11'))
     print("AprilTag detector created successfully")
     
     # Create a simple test image
