@@ -9,13 +9,13 @@ opencv-python>=4.5.0
 # opencv-python-headless>=4.5.0
 
 # AprilTag detection
-apriltag>=3.0.0
+# NOTE: The code uses 'pupil_apriltags' (Python bindings for the C++ AprilTag detector).
+# Do NOT install 'apriltag' as it uses a different API and will cause import errors.
+pupil-apriltags>=1.0.0
 
 # DepthAI - PINNED TO V2 API (v3.0+ has breaking changes)
 depthai<3.0.0
 
-# Scientific computing
+# Scientific computing & linear algebra
 numpy>=1.20.0
-
-# Optional: Additional utilities
 scipy>=1.7.0
