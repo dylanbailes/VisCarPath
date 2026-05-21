@@ -7,6 +7,8 @@ Kalman filtering, and MPC control for real-time autonomous navigation
 import cv2
 import numpy as np
 import time
+import warnings
+warnings.filterwarnings("ignore", category=RuntimeWarning, module="numpy")
 from typing import Optional, Dict, Any
 from dataclasses import dataclass
 from enum import Enum
@@ -70,6 +72,10 @@ class AutonomousNavigator:
         """
         print("Initializing Autonomous Navigation System...")
         
+                # Cache to prevent processing frames twice
+        self.last_rgb = None
+        self.last_depth = None
+        self.last_tags = []
         # Initialize OAK-D pipeline
         self.oak_pipeline = OakDAprilTagPipeline()
         
@@ -128,10 +134,11 @@ class AutonomousNavigator:
         self.oak_pipeline.start()
         
         # Set camera intrinsics for ground pipeline
-        fx = self.oak_pipeline.april_detector.fx
-        fy = self.oak_pipeline.april_detector.fy
-        cx = self.oak_pipeline.april_detector.cx
-        cy = self.oak_pipeline.april_detector.cy
+        ratio = 480 / 1080  # Based on our RGB resolution
+        fx = self.oak_pipeline.april_detector.fx * ratio
+        fy = self.oak_pipeline.april_detector.fy * ratio
+        cx = self.oak_pipeline.april_detector.cx * ratio
+        cy = self.oak_pipeline.april_detector.cy * ratio
         
         self.ground_pipeline.set_camera_intrinsics(fx, fy, cx, cy)
         
@@ -165,6 +172,9 @@ class AutonomousNavigator:
         
         # Detect AprilTags
         tag_detections = self.oak_pipeline.detect_tags_in_frame(rgb_frame, depth_frame)
+        self.last_rgb = rgb_frame
+        self.last_depth = depth_frame
+        self.last_tags = tag_detections
         
         # Learn new tag positions if not in map
         for tag in tag_detections:
@@ -253,11 +263,15 @@ class AutonomousNavigator:
                 for seg in path:
                     mpc_path.append(seg)
                 
-                # Compute control
-                accel, steer = self.mpc_controller.compute_control(
-                    mpc_path if mpc_path else [],
-                    obstacles
-                )
+                try:
+                    accel, steer = self.mpc_controller.compute_control(
+                        mpc_path if mpc_path else [],
+                        obstacles
+                    )
+                except Exception as e:
+                    # Fallback to zero commands if controller math fails
+                    print(f"[MPC Fallback] {e}")
+                    accel, steer = 0.0, 0.0
                 
                 # Limit commands based on state
                 if self.navigation_state == NavigationState.OBSTRUCTED:
@@ -315,115 +329,88 @@ class AutonomousNavigator:
         }
     
     def run_visualization(self, show_diagnostics: bool = True):
-        """
-        Run navigation with visualization
-        
-        Args:
-            show_diagnostics: Whether to display diagnostic overlay
-        """
+        """Run navigation with stable visualization"""
         print("Starting visualization mode. Press 'q' to quit.")
         
         try:
             while True:
-                # Process frame
+                # 1. Process heavy math
                 command = self.process_frame()
                 
-                # Get latest frame for display
-                rgb, depth, _ = self.oak_pipeline.get_frame_data()
-                
-                if rgb is None:
+                # 2. Skip drawing if no frame ready yet
+                if self.last_rgb is None:
+                    # CRITICAL: Keep OpenCV window alive even when skipping
+                    if cv2.waitKey(1) & 0xFF == ord('q'):
+                        break
                     continue
                 
-                # Convert for display
-                display = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+                # 3. Prepare display
+                display = cv2.cvtColor(self.last_rgb, cv2.COLOR_RGB2BGR)
                 h, w = display.shape[:2]
+                ground_tags = self.last_tags
                 
-                # Get detections
-                gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
-                tag_detections = self.oak_pipeline.april_detector.detect_tags(gray)
-                ground_tags = self.oak_pipeline.april_detector.filter_ground_tags(tag_detections)
-                
-                # Draw tag detections
+                # 4. Draw detections (with bounds checking & safe formatting)
                 for tag in ground_tags:
+                    # Skip invalid/nan detections
+                    if np.isnan(tag.distance) or not (0 < tag.center[0] < w and 0 < tag.center[1] < h):
+                        continue
+                        
                     color = (0, 255, 0) if tag.tag_id == self.target_tag_id else (0, 255, 255)
-                    
-                    # Draw center
                     cv2.circle(display, tag.center, 8, color, -1)
                     
-                    # Draw ID and distance
-                    label = f"ID:{tag.tag_id} {tag.distance:.2f}m"
-                    cv2.putText(display, label,
-                               (tag.center[0] + 15, tag.center[1]),
+                    # CRITICAL: Wrap numpy values in float() for f-string formatting
+                    dist = float(tag.distance)
+                    bearing_deg = float(np.degrees(np.squeeze(tag.bearing)))
+                    
+                    label = f"ID:{tag.tag_id} {dist:.2f}m"
+                    cv2.putText(display, label, (tag.center[0] + 15, tag.center[1]),
                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
                     
-                    # Draw bearing
-                    bearing_deg = np.degrees(tag.bearing)
                     cv2.putText(display, f"{bearing_deg:.1f}°",
                                (tag.center[0] + 15, tag.center[1] + 25),
                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
                 
-                # Draw navigation state
+                # 5. Draw navigation state
                 state_color = {
                     NavigationState.IDLE: (200, 200, 200),
                     NavigationState.DETECTING_TAGS: (255, 255, 0),
                     NavigationState.NAVIGATING: (0, 255, 0),
                     NavigationState.OBSTRUCTED: (0, 0, 255),
                     NavigationState.TARGET_REACHED: (255, 0, 255),
-                    NavigationState.ERROR: (0, 0, 255)
                 }.get(self.navigation_state, (200, 200, 200))
                 
                 cv2.putText(display, f"State: {self.navigation_state.value}",
                            (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, state_color, 2)
                 
-                # Draw diagnostics
+                # 6. Draw diagnostics & commands
                 if show_diagnostics:
                     diag = self.get_diagnostics()
                     y_offset = 60
                     for key, value in diag.items():
                         if key != 'navigation_state':
-                            label = f"{key}: {value}"
-                            if isinstance(value, float):
-                                label = f"{key}: {value:.3f}"
-                            cv2.putText(display, label,
-                                       (10, y_offset),
-                                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                            val_str = f"{value:.3f}" if isinstance(value, float) else str(value)
+                            cv2.putText(display, f"{key}: {val_str}",
+                                       (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
                             y_offset += 20
                 
-                # Draw control commands
-                cmd_y = h - 60
-                cv2.putText(display, f"Accel: {self.current_command.acceleration:.3f} m/s²",
-                           (10, cmd_y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
-                cv2.putText(display, f"Steer: {self.current_command.steering_rate:.3f} rad/s",
-                           (10, cmd_y + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+                cmd_y = h - 40
+                cv2.putText(display, f"Accel: {command.acceleration:.2f} | Steer: {command.steering_rate:.2f}",
+                           (10, cmd_y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
                 
-                # Display (skip if no GUI support available)
-                try:
-                    cv2.imshow("Autonomous Navigation", display)
-                    
-                    # Handle keyboard input
-                    key = cv2.waitKey(1) & 0xFF
-                    if key == ord('q'):
-                        break
-                    elif key == ord('t'):
-                        # Set target to first detected tag
-                        if ground_tags:
-                            self.set_target_tag(ground_tags[0].tag_id)
-                except cv2.error as e:
-                    print(f"GUI not available: {e}")
-                    print("Running in headless mode. Press Ctrl+C to stop.")
-                    # Run without visualization for a few iterations
-                    time.sleep(5)
+                # 7. Display & handle input
+                cv2.imshow("Autonomous Navigation", display)
+                
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord('q'):
                     break
-                        
+                elif key == ord('t') and ground_tags:
+                    self.set_target_tag(ground_tags[0].tag_id)
+                    
         except KeyboardInterrupt:
             print("\nInterrupted by user")
         finally:
             self.stop()
-            try:
-                cv2.destroyAllWindows()
-            except:
-                pass  # Ignore GUI errors in headless mode
-
+            cv2.destroyAllWindows()
 
 def main():
     """Main entry point"""

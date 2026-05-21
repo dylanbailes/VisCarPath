@@ -58,7 +58,7 @@ class GroundPlaneDetector:
     def __init__(self, 
                  ransac_threshold: float = 0.05,  # 5cm threshold
                  min_inliers: int = 100,
-                 max_iterations: int = 1000):
+                 max_iterations: int = 100):
         """
         Initialize ground plane detector
         
@@ -77,18 +77,25 @@ class GroundPlaneDetector:
     def detect_ground_plane(self, depth_map: np.ndarray, 
                            camera_intrinsics: np.ndarray,
                            tag_masks: Optional[np.ndarray] = None) -> Optional[GroundPlane]:
-        """
-        Detect ground plane from depth map using RANSAC
+        """Detect ground plane from depth map using RANSAC"""
         
-        Args:
-            depth_map: Depth map in meters (or mm, will be converted)
-            camera_intrinsics: 3x3 camera intrinsic matrix
-            tag_masks: Optional binary mask marking AprilTag regions to exclude
-            
-        Returns:
-            GroundPlane object or None if detection fails
-        """
+        # 🔥 CRITICAL: Downsample to 320x240 for RANSAC (cuts pixels by 75%)
         h, w = depth_map.shape
+        if h > 240 or w > 320:
+            depth_map = cv2.resize(depth_map, (320, 240), interpolation=cv2.INTER_NEAREST)
+            # Also resize tag_mask if provided
+            if tag_masks is not None:
+                tag_masks = cv2.resize(tag_masks, (320, 240), interpolation=cv2.INTER_NEAREST)
+            # Scale intrinsics for new resolution
+            scale_x = 320 / w
+            scale_y = 240 / h
+            camera_intrinsics = camera_intrinsics.copy()
+            camera_intrinsics[0, 0] *= scale_x  # fx
+            camera_intrinsics[1, 1] *= scale_y  # fy
+            camera_intrinsics[0, 2] *= scale_x  # cx
+            camera_intrinsics[1, 2] *= scale_y  # cy
+        
+        h, w = depth_map.shape  # Update for new size
         
         # Convert depth to meters if needed (assume >1000 means mm)
         if np.median(depth_map[depth_map > 0]) > 100:
@@ -125,13 +132,13 @@ class GroundPlaneDetector:
         
         points_3d = np.column_stack([x_cam, y_cam, z_cam])
         
-        # RANSAC plane fitting
+        # RANSAC plane fitting (original structure, but with downsampling applied above)
         best_normal = None
         best_distance = None
         best_inliers = 0
-        best_inlier_mask = None
+        best_inlier_mask = None  # ← MUST track this for bounds calculation later
         
-        for _ in range(self.max_iterations):
+        for _ in range(self.max_iterations):  # Now only 100 iterations instead of 1000
             # Sample 3 random points
             if len(points_3d) < 3:
                 break
@@ -162,8 +169,8 @@ class GroundPlaneDetector:
                 best_inliers = num_inliers
                 best_normal = normal
                 best_distance = distance
-                best_inlier_mask = inlier_mask
-        
+                best_inlier_mask = inlier_mask  # ← CRITICAL: Keep tracking this!
+
         # Validate detection
         if best_inliers < self.min_inliers:
             return None
@@ -240,7 +247,22 @@ class ObstacleDetector:
         Returns:
             List of detected obstacles
         """
-        h, w = depth_map.shape
+        # 🔥 Downsample for obstacle detection too
+        orig_h, orig_w = depth_map.shape
+        if orig_h > 240 or orig_w > 320:
+            depth_map = cv2.resize(depth_map, (320, 240), interpolation=cv2.INTER_NEAREST)
+            if tag_masks is not None:
+                tag_masks = cv2.resize(tag_masks, (320, 240), interpolation=cv2.INTER_NEAREST)
+            # Scale intrinsics for new resolution
+            scale_x = 320 / orig_w
+            scale_y = 240 / orig_h
+            camera_intrinsics = camera_intrinsics.copy()
+            camera_intrinsics[0, 0] *= scale_x
+            camera_intrinsics[1, 1] *= scale_y
+            camera_intrinsics[0, 2] *= scale_x
+            camera_intrinsics[1, 2] *= scale_y
+        
+        h, w = depth_map.shape  # Update for new size
         
         # Convert depth to meters
         if np.median(depth_map[depth_map > 0]) > 100:
@@ -317,9 +339,10 @@ class ObstacleDetector:
                 distance = np.linalg.norm(position_3d)
                 bearing = np.arctan2(x_centroid, z_centroid)
                 
-                # Calculate severity based on height and proximity
-                avg_height = np.mean(height_above_ground[labels == i])
-                severity = min(1.0, avg_height / 0.5) * (1.0 / distance)
+                # Calculate severity based on obstacle height above ground and proximity
+                # Use the actual height_above_ground at the centroid, not global average
+                centroid_height = height_above_ground[int(centroid_v), int(centroid_u)]
+                severity = min(1.0, centroid_height / 0.3) * (1.0 / max(0.1, distance))
                 
                 obstacle = Obstacle(
                     center=(int(centroid_u), int(centroid_v)),
@@ -364,27 +387,22 @@ class PathPlanner:
                        ground_plane: GroundPlane) -> np.ndarray:
         """
         Create 2D cost map for path planning
-        
-        Args:
-            width, height: Map dimensions
-            obstacles: List of detected obstacles
-            camera_intrinsics: Camera intrinsics
-            ground_plane: Ground plane parameters
-            
-        Returns:
-            2D cost map (lower cost = more navigable)
         """
         # Initialize cost map
         cost_map = np.ones((height, width), dtype=np.float32)
         
         # Add obstacle costs
         for obs in obstacles:
-            if obs.distance > self.max_lookahead:
+            # 🔥 CRITICAL SAFETY: Skip obstacles that are invalid, too close, or too far
+            # obs.distance == 0.0 causes division by zero -> inf -> OverflowError
+            if obs.distance < 0.1 or obs.distance > self.max_lookahead:
                 continue
                 
-            # Project obstacle influence radius
+            # Clamp distance to prevent infinity
+            safe_distance = max(0.1, obs.distance)
+            
             influence_radius = int((self.robot_width/2 + self.min_clearance) * 
-                                   camera_intrinsics[0, 0] / obs.distance)
+                                   camera_intrinsics[0, 0] / safe_distance)
             
             # Draw cost gradient around obstacle
             y, x = np.ogrid[:height, :width]
@@ -392,7 +410,7 @@ class PathPlanner:
             
             # Cost increases near obstacle
             obstacle_cost = np.exp(-dist_from_obs / (influence_radius / 2))
-            cost_map = np.maximum(cost_map, obstacle_cost * 10)  # High cost near obstacles
+            cost_map = np.maximum(cost_map, obstacle_cost * 10)
         
         # Prefer center of image (straight ahead)
         center_x = width // 2
@@ -444,7 +462,8 @@ class PathPlanner:
         # Direct path to tag
         direct_vector = tag_pos - np.array([0, 0, 0])  # From camera origin
         direct_distance = np.linalg.norm(direct_vector)
-        
+        if direct_distance < 0.1:
+            return None  # Already at target
         if direct_distance > self.max_lookahead:
             # Scale to max lookahead
             direct_vector = direct_vector * (self.max_lookahead / direct_distance)

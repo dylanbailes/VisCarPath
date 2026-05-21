@@ -274,7 +274,12 @@ class TagMeasurementFusion:
         bearing = tag_detection.bearing
         vehicle_theta_estimate = tag_world_theta - bearing
         
-        return np.array([vehicle_x_estimate, vehicle_y_estimate, vehicle_theta_estimate])
+        # Force all values to pure Python scalars to prevent numpy shape mismatch
+        return np.array([
+            float(np.asarray(vehicle_x_estimate).item()),
+            float(np.asarray(vehicle_y_estimate).item()),
+            float(np.asarray(vehicle_theta_estimate).item())
+        ])
     
     def fuse_multiple_tags(self, tag_detections: list) -> Optional[np.ndarray]:
         """

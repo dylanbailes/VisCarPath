@@ -66,7 +66,7 @@ class AprilTagDetector:
         self.cy = 360.0
         
         # Tag size in meters (should be configured based on actual tags)
-        self.tag_size = 0.16  # 16cm standard AprilTag
+        self.tag_size = 0.04  # 4cm standard AprilTag
 
         
     def set_camera_intrinsics(self, fx: float, fy: float, cx: float, cy: float):
@@ -76,81 +76,63 @@ class AprilTagDetector:
         self.cx = cx
         self.cy = cy
         
-    def detect_tags(self, image_gray: np.ndarray, 
-                    depth_map: Optional[np.ndarray] = None) -> List[AprilTagDetection]:
-        """
-        Detect AprilTags in grayscale image
-        
-        Args:
-            image_gray: Grayscale input image
-            depth_map: Optional depth map from OAK-D for improved pose estimation
-            
-        Returns:
-            List of AprilTagDetection objects
-        """
+    def detect_tags(self, gray_frame: np.ndarray, depth_frame: np.ndarray) -> List[AprilTagDetection]:
+        """Detect tags and compute accurate 3D pose using PnP"""
         detections = []
+        h, w = gray_frame.shape[:2]
         
-        # Run AprilTag detection
-        results = self.detector.detect(image_gray)
+        # 1. Run pupil_apriltags detector
+        results = self.detector.detect(gray_frame)
+        
+        # 2. CORRECTED Intrinsics for 640x480 OAK-D Lite Preview
+        # cx/cy MUST be image center. fx/fy scaled from native OAK-D calibration.
+        fx = 1006.0  # Focal length X for 640px width
+        fy = 1005.0  # Focal length Y for 480px height
+        cx = w / 2.0 # Optical center X (MUST be 320 for 640px width)
+        cy = h / 2.0 # Optical center Y (MUST be 240 for 480px height)
+        
+        K = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]])
+        dist_coeffs = np.zeros(4)  # OAK-D Lite distortion is negligible at center
+        
+        # 3. 3D Object Points (centered square, in meters)
+        half_size = self.tag_size / 2.0
+        obj_points = np.array([
+            [-half_size,  half_size, 0],
+            [ half_size,  half_size, 0],
+            [ half_size, -half_size, 0],
+            [-half_size, -half_size, 0]
+        ], dtype=np.float32)
         
         for result in results:
-            # Get tag center in pixel coordinates
-            corners = result.corners
-            center = (int(np.mean(corners[:, 0])), int(np.mean(corners[:, 1])))
+            center = tuple(np.mean(result.corners, axis=0).astype(int))
+            img_points = result.corners.astype(np.float32)
             
-            # Estimate pose using PnP if we have good corner detection
-            if len(corners) == 4:
-                # Object points (3D tag corners in tag coordinate system)
-                obj_points = np.array([
-                    [-self.tag_size/2, -self.tag_size/2, 0],
-                    [self.tag_size/2, -self.tag_size/2, 0],
-                    [self.tag_size/2, self.tag_size/2, 0],
-                    [-self.tag_size/2, self.tag_size/2, 0]
-                ], dtype=np.float32)
+            # 4. Solve PnP
+            success, rvec, tvec = cv2.solvePnP(
+                obj_points, img_points, K, dist_coeffs,
+                flags=cv2.SOLVEPNP_IPPE_SQUARE
+            )
+            
+            if success:
+                t = tvec.flatten()
+                distance = float(np.linalg.norm(t))  # Euclidean distance from camera lens
+                bearing = float(np.arctan2(t[0], t[2]))
                 
-                # Image points (2D detected corners)
-                img_points = corners.astype(np.float32)
+                R, _ = cv2.Rodrigues(rvec)
+                pose = np.eye(4)
+                pose[:3, :3] = R
+                pose[:3, 3] = t
                 
-                # Camera matrix
-                K = np.array([
-                    [self.fx, 0, self.cx],
-                    [0, self.fy, self.cy],
-                    [0, 0, 1]
-                ])
+                detections.append(AprilTagDetection(
+                    tag_id=result.tag_id,
+                    tag_family=self.tag_family,
+                    center=center,
+                    pose=pose,
+                    distance=distance,
+                    bearing=bearing,
+                    confidence=result.decision_margin
+                ))
                 
-                # Distortion coefficients (assuming rectified image)
-                dist_coeffs = np.zeros(5)
-                
-                # Solve PnP
-                success, rvec, tvec = cv2.solvePnP(
-                    obj_points, img_points, K, dist_coeffs,
-                    flags=cv2.SOLVEPNP_IPPE_SQUARE  # Optimized for planar targets
-                )
-                
-                if success:
-                    # Convert rotation vector to matrix
-                    R, _ = cv2.Rodrigues(rvec)
-                    
-                    # Build 4x4 transformation matrix (camera to tag)
-                    pose = np.eye(4)
-                    pose[:3, :3] = R
-                    pose[:3, 3] = tvec.flatten()
-                    
-                    # Calculate distance and bearing
-                    distance = np.linalg.norm(tvec)
-                    bearing = np.arctan2(tvec[0], tvec[2])  # Horizontal angle
-                    
-                    detection = AprilTagDetection(
-                        tag_id=result.tag_id,
-                        tag_family=self.tag_family,
-                        center=center,
-                        pose=pose,
-                        distance=distance,
-                        bearing=bearing,
-                        confidence=result.decision_margin
-                    )
-                    detections.append(detection)
-        
         return detections
     
     def filter_ground_tags(self, detections: List[AprilTagDetection],
@@ -221,11 +203,11 @@ class OakDAprilTagPipeline:
         stereo = self.pipeline.create(dai.node.StereoDepth)
         
         # 2. RGB camera configuration
-        cam_rgb.setPreviewSize(1280, 720)
+        cam_rgb.setPreviewSize(640, 480)
         cam_rgb.setResolution(dai.ColorCameraProperties.SensorResolution.THE_1080_P)
         cam_rgb.setInterleaved(False)
         cam_rgb.setColorOrder(dai.ColorCameraProperties.ColorOrder.RGB)
-        cam_rgb.setFps(30)
+        cam_rgb.setFps(15)
         
         # 3. Mono cameras configuration (Required for StereoDepth)
         mono_left.setResolution(dai.MonoCameraProperties.SensorResolution.THE_400_P)
@@ -235,10 +217,19 @@ class OakDAprilTagPipeline:
         mono_right.setBoardSocket(dai.CameraBoardSocket.RIGHT)
         
         # 4. Stereo depth configuration
-        stereo.setDefaultProfilePreset(dai.node.StereoDepth.PresetMode.HIGH_ACCURACY)
-        stereo.setDepthAlign(dai.CameraBoardSocket.RGB)  # Aligns depth map to the RGB camera!
-        stereo.setOutputSize(1280, 720)
+        # 4. Stereo depth configuration (optimized for Windows USB stability)
+                # 4. Stereo depth configuration (ORDER MATTERS!)
+        stereo.setDefaultProfilePreset(dai.node.StereoDepth.PresetMode.DEFAULT)
+        stereo.setOutputSize(640, 480)
+        stereo.setRectifyEdgeFillColor(0)
         
+        # CRITICAL: Must be set AFTER the preset, otherwise it gets overwritten!
+        stereo.setDepthAlign(dai.CameraBoardSocket.RGB)
+        stereo.setLeftRightCheck(True)  # REQUIRED for RGB/CENTER alignment
+        
+        # Disable heavy features to save USB bandwidth
+        stereo.setExtendedDisparity(False)
+        stereo.setSubpixel(False)
         # 5. Link Mono cameras to Stereo Depth
         mono_left.out.link(stereo.left)
         mono_right.out.link(stereo.right)
@@ -266,11 +257,20 @@ class OakDAprilTagPipeline:
         
         if self.pipeline is None:
             return
-        
-        self.device = dai.Device(self.pipeline, usb2Mode=True)
-        self.q_rgb = self.device.getOutputQueue(name="rgb", maxSize=4, blocking=False)
-        self.q_depth = self.device.getOutputQueue(name="depth", maxSize=4, blocking=False)
-        
+
+        try:
+            # Try USB 3.0 first
+            print("Attempting USB 3.0 connection...")
+            self.device = dai.Device(self.pipeline, maxUsbSpeed=dai.UsbSpeed.SUPER)
+            print("✅ Connected via USB 3.0!")
+        except RuntimeError as e:
+            # Windows USB stack often fails the initial StereoDepth handshake
+            print(f"⚠️ USB 3.0 handshake failed ({e}). Falling back to USB 2.0...")
+            self.device = dai.Device(self.pipeline, usb2Mode=True)
+            print("✅ Connected via USB 2.0 (stable for testing)")
+
+            self.q_rgb = self.device.getOutputQueue(name="rgb", maxSize=1, blocking=False)
+            self.q_depth = self.device.getOutputQueue(name="depth", maxSize=1, blocking=False)
         # Get camera intrinsics from calibration
         calib = self.device.readCalibration()
         intrinsics = calib.getCameraIntrinsics(dai.CameraBoardSocket.CAM_A)
@@ -285,29 +285,25 @@ class OakDAprilTagPipeline:
         print(f"OAK-D initialized with intrinsics: fx={fx:.1f}, fy={fy:.1f}, cx={cx:.1f}, cy={cy:.1f}")
         
     def get_frame_data(self):
-        """
-        Get synchronized RGB and depth frames
-        
-        Returns:
-            Tuple of (rgb_frame, depth_frame, timestamp) or (None, None, None) if unavailable
-        """
+        """Get synchronized RGB and depth frames (non-blocking, drops stale frames)"""
         if not DEPTHAI_AVAILABLE or self.q_rgb is None or self.q_depth is None:
-            # Return simulated data in simulation mode
             return self._get_simulated_frame()
             
-        rgb_packet = self.q_rgb.tryGet()
-        depth_packet = self.q_depth.tryGet()
-        
+        # BLOCKING wait for synchronized frames (safe now that we cache results)
+
+        rgb_packet = self.q_rgb.get()
+        depth_packet = self.q_depth.get()
+        # Only process if we have BOTH frames (keeps them synced)
         if rgb_packet is not None and depth_packet is not None:
             rgb_frame = rgb_packet.getCvFrame()
             depth_frame = depth_packet.getFrame()  # Depth in mm
             
-            # Convert BGR to RGB if needed
             if len(rgb_frame.shape) == 3 and rgb_frame.shape[2] == 3:
                 rgb_frame = cv2.cvtColor(rgb_frame, cv2.COLOR_BGR2RGB)
             
             return rgb_frame, depth_frame, rgb_packet.getTimestampDevice()
         
+        # Return last known good data or skip
         return None, None, None
     
     def _get_simulated_frame(self):
@@ -318,28 +314,19 @@ class OakDAprilTagPipeline:
         depth_frame = np.zeros((720, 1280), dtype=np.uint16)
         return rgb_frame, depth_frame, 0.0
     
-    def detect_tags_in_frame(self, rgb_frame: np.ndarray, 
-                            depth_frame: np.ndarray) -> List[AprilTagDetection]:
+    def detect_tags_in_frame(self, rgb_frame: np.ndarray, depth_frame: np.ndarray) -> List[AprilTagDetection]:
         """
-        Detect AprilTags in a single frame
-        
-        Args:
-            rgb_frame: RGB image from OAK-D
-            depth_frame: Depth map from OAK-D (in mm)
-            
-        Returns:
-            List of AprilTagDetection objects
+        Detect AprilTags in a frame using RGB + Depth for 3D pose.
+        TEMPORARILY returns ALL tags to bypass strict ground filtering.
         """
-        # Convert to grayscale for AprilTag detection
         gray = cv2.cvtColor(rgb_frame, cv2.COLOR_RGB2GRAY)
         
-        # Detect tags
+        # Run the full detection + PnP pipeline
         detections = self.april_detector.detect_tags(gray, depth_frame)
         
-        # Filter for ground-level tags
-        ground_tags = self.april_detector.filter_ground_tags(detections)
-        
-        return ground_tags
+        # 🔥 CRITICAL FIX: Return ALL detections for now
+        # (Bypasses filter_ground_tags() which was dropping 100% of tags due to strict pitch math)
+        return detections
     
     def stop(self):
         """Stop OAK-D device"""
