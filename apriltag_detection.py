@@ -84,14 +84,13 @@ class AprilTagDetector:
         # 1. Run pupil_apriltags detector
         results = self.detector.detect(gray_frame)
         
-        # 2. CORRECTED Intrinsics for 640x480 OAK-D Lite Preview
-        # cx/cy MUST be image center. fx/fy scaled from native OAK-D calibration.
-        fx = 1006.0  # Focal length X for 640px width
-        fy = 1005.0  # Focal length Y for 480px height
-        cx = w / 2.0 # Optical center X (MUST be 320 for 640px width)
-        cy = h / 2.0 # Optical center Y (MUST be 240 for 480px height)
-        
-        K = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]])
+        # Remove the hardcoded fx, fy, cx, cy block.
+        # Instead, use the intrinsics stored in the class instance from the setup phase:
+        K = np.array([
+            [self.fx, 0, self.cx], 
+            [0, self.fy, self.cy], 
+            [0, 0, 1]
+        ])
         dist_coeffs = np.zeros(4)  # OAK-D Lite distortion is negligible at center
         
         # 3. 3D Object Points (centered square, in meters)
@@ -203,8 +202,14 @@ class OakDAprilTagPipeline:
         stereo = self.pipeline.create(dai.node.StereoDepth)
         
         # 2. RGB camera configuration
+        # ... existing cam_rgb configuration ...
         cam_rgb.setPreviewSize(640, 480)
         cam_rgb.setResolution(dai.ColorCameraProperties.SensorResolution.THE_1080_P)
+
+        # CRITICAL: Lock autofocus for stable PnP calculations
+        # 130 on the 0-255 scale roughly locks focus between 1m and infinity for the OAK-D AF module
+        cam_rgb.initialControl.setAutofocusMode(dai.CameraControl.AutoFocusMode.OFF)
+        cam_rgb.initialControl.setManualFocus(130) 
         cam_rgb.setInterleaved(False)
         cam_rgb.setColorOrder(dai.ColorCameraProperties.ColorOrder.RGB)
         cam_rgb.setFps(15)
@@ -272,10 +277,11 @@ class OakDAprilTagPipeline:
             self.q_rgb = self.device.getOutputQueue(name="rgb", maxSize=1, blocking=False)
             self.q_depth = self.device.getOutputQueue(name="depth", maxSize=1, blocking=False)
         # Get camera intrinsics from calibration
+        # Get camera intrinsics from calibration
         calib = self.device.readCalibration()
-        intrinsics = calib.getCameraIntrinsics(dai.CameraBoardSocket.CAM_A)
-        
-        # Update detector with actual intrinsics
+        # CRITICAL: Explicitly request intrinsics for the 640x480 preview resolution
+        intrinsics = calib.getCameraIntrinsics(dai.CameraBoardSocket.CAM_A, 640, 480)
+
         fx = intrinsics[0][0]
         fy = intrinsics[1][1]
         cx = intrinsics[0][2]

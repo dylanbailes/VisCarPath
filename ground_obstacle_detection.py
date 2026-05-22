@@ -362,159 +362,107 @@ class ObstacleDetector:
 
 class PathPlanner:
     """
-    Creates navigable paths avoiding obstacles toward AprilTag targets
+    Reactive Vector Field Path Planner (Vectorized)
+    Evaluates high-resolution heading candidates using NumPy broadcasting
+    to balance target alignment and obstacle avoidance.
     """
-    
     def __init__(self,
-                 robot_width: float = 0.5,  # Robot width in meters
-                 min_clearance: float = 0.2,  # Minimum clearance from obstacles
-                 max_lookahead: float = 3.0):  # Maximum lookahead distance
-        """
-        Initialize path planner
-        
-        Args:
-            robot_width: Robot width including safety margin
-            min_clearance: Minimum distance from obstacles
-            max_lookahead: Maximum planning horizon
-        """
+                 robot_width: float = 0.5,
+                 min_clearance: float = 0.2,
+                 max_lookahead: float = 3.0):
         self.robot_width = robot_width
         self.min_clearance = min_clearance
         self.max_lookahead = max_lookahead
         
-    def create_cost_map(self, width: int, height: int,
-                       obstacles: List[Obstacle],
-                       camera_intrinsics: np.ndarray,
-                       ground_plane: GroundPlane) -> np.ndarray:
-        """
-        Create 2D cost map for path planning
-        """
-        # Initialize cost map
-        cost_map = np.ones((height, width), dtype=np.float32)
+        # High-resolution candidate angles: -60 to +60 degrees (1-degree steps)
+        self.thetas = np.deg2rad(np.arange(-40, 41, 1))
         
-        # Add obstacle costs
+        # Cost function weights
+        self.w_target = 1.0
+        self.w_obs = 5.0
+        self.margin_rad = np.deg2rad(5)
+
+    def plan_path_to_tag(self, tag_detection, obstacles: list,
+                         ground_plane, camera_intrinsics: np.ndarray,
+                         image_shape: tuple) -> Optional[list]:
+        """
+        Plan path using vectorized angular evaluation.
+        """
+        # 1. Extract target vector in X-Z plane (camera frame)
+        tag_pos = tag_detection.pose[:3, 3]
+        tag_x, tag_z = tag_pos[0], tag_pos[2]
+        target_dist = np.hypot(tag_x, tag_z)
+        
+        if target_dist < 0.1:
+            return None
+            
+        target_angle = np.arctan2(tag_x, tag_z)
+        fx = camera_intrinsics[0, 0]
+        
+        # 2. Precompute obstacle angular blockers
+        obs_blockers = []
         for obs in obstacles:
-            # 🔥 CRITICAL SAFETY: Skip obstacles that are invalid, too close, or too far
-            # obs.distance == 0.0 causes division by zero -> inf -> OverflowError
-            if obs.distance < 0.1 or obs.distance > self.max_lookahead:
+            obs_x, obs_z = obs.position_3d[0], obs.position_3d[2]
+            d = np.hypot(obs_x, obs_z)
+            
+            if d < 0.1 or obs_z < 0:
                 continue
                 
-            # Clamp distance to prevent infinity
-            safe_distance = max(0.1, obs.distance)
+            # Pinhole model: convert pixel width to real-world meters
+            obs_width_m = (obs.size[0] * obs_z) / fx
+            r_safe = (obs_width_m / 2.0) + (self.robot_width / 2.0) + self.min_clearance
             
-            influence_radius = int((self.robot_width/2 + self.min_clearance) * 
-                                   camera_intrinsics[0, 0] / safe_distance)
+            obs_angle = np.arctan2(obs_x, obs_z)
             
-            # Draw cost gradient around obstacle
-            y, x = np.ogrid[:height, :width]
-            dist_from_obs = np.sqrt((x - obs.center[0])**2 + (y - obs.center[1])**2)
+            if d <= r_safe:
+                obs_blockers.append((obs_angle, np.pi, d))
+            else:
+                delta_theta = np.arcsin(np.clip(r_safe / d, -1.0, 1.0))
+                obs_blockers.append((obs_angle, delta_theta, d))
+                
+        # 3. Vectorized Cost Evaluation
+        # Target alignment cost: 0 (perfect alignment) to 2 (opposite direction)
+        diff_target = self._wrap_angle(self.thetas - target_angle)
+        cost_target = 1.0 - np.cos(diff_target)
+        
+        # Obstacle penalty (accumulated via broadcasting)
+        cost_obs = np.zeros_like(self.thetas)
+        for obs_angle, delta_theta, d in obs_blockers:
+            diff_obs = self._wrap_angle(self.thetas - obs_angle)
+            blocked_zone = delta_theta + self.margin_rad
             
-            # Cost increases near obstacle
-            obstacle_cost = np.exp(-dist_from_obs / (influence_radius / 2))
-            cost_map = np.maximum(cost_map, obstacle_cost * 10)
-        
-        # Prefer center of image (straight ahead)
-        center_x = width // 2
-        y, x = np.ogrid[:height, :width]
-        center_preference = np.abs(x - center_x) / width
-        cost_map += center_preference
-        
-        return cost_map
-    
-    def plan_path_to_tag(self, tag_detection,
-                        obstacles: List[Obstacle],
-                        ground_plane: GroundPlane,
-                        camera_intrinsics: np.ndarray,
-                        image_shape: tuple) -> Optional[List[PathSegment]]:
-        """
-        Plan path from current position to AprilTag target
-        
-        Args:
-            tag_detection: Target AprilTag detection
-            obstacles: List of obstacles to avoid
-            ground_plane: Ground plane parameters
-            camera_intrinsics: Camera intrinsics
-            image_shape: Image dimensions (h, w)
+            # Penetration depth: 1.0 at center of obstacle, 0.0 at edge of blocked zone
+            penetration = np.maximum(0.0, 1.0 - (np.abs(diff_obs) / blocked_zone))
+            proximity_factor = 1.0 / max(0.5, d)
+            cost_obs += penetration * proximity_factor
             
-        Returns:
-            List of PathSegment objects or None if no path found
-        """
-        h, w = image_shape
+        total_cost = (self.w_target * cost_target) + (self.w_obs * cost_obs)
         
-        # Create cost map
-        cost_map = self.create_cost_map(
-            w, h, obstacles, camera_intrinsics, ground_plane
+        # 4. Select optimal heading
+        best_idx = np.argmin(total_cost)
+        best_angle = self.thetas[best_idx]
+        
+        # 5. Generate 3D Waypoint and PathSegment
+        lookahead = min(self.max_lookahead, target_dist)
+        wp_x = lookahead * np.sin(best_angle)
+        wp_z = lookahead * np.cos(best_angle)
+        wp_3d = np.array([wp_x, 0.0, wp_z])
+        
+        segment = PathSegment(
+            start=np.array([0.0, 0.0, 0.0]),
+            end=wp_3d,
+            width=self.robot_width,
+            clearance=self.min_clearance,
+            cost=float(total_cost[best_idx])
         )
         
-        # Start position (bottom center of image - robot position)
-        start_u, start_v = w // 2, int(h * 0.8)
-        
-        # Goal position (tag center)
-        goal_u, goal_v = tag_detection.center
-        
-        # Tag 3D position
-        tag_pos = tag_detection.pose[:3, 3]
-        
-        # Simple A* or gradient descent path planning
-        # For now, use simple straight-line with obstacle avoidance
-        
-        path_segments = []
-        
-        # Direct path to tag
-        direct_vector = tag_pos - np.array([0, 0, 0])  # From camera origin
-        direct_distance = np.linalg.norm(direct_vector)
-        if direct_distance < 0.1:
-            return None  # Already at target
-        if direct_distance > self.max_lookahead:
-            # Scale to max lookahead
-            direct_vector = direct_vector * (self.max_lookahead / direct_distance)
-        
-        # Check for obstacles along direct path
-        path_clear = True
-        min_clearance = float('inf')
-        
-        for obs in obstacles:
-            # Calculate perpendicular distance from obstacle to path
-            path_direction = direct_vector / np.linalg.norm(direct_vector)
-            obs_vector = obs.position_3d
-            proj_length = np.dot(obs_vector, path_direction)
-            closest_point = path_direction * proj_length
-            perp_distance = np.linalg.norm(obs_vector - closest_point)
-            
-            if 0 < proj_length < np.linalg.norm(direct_vector):
-                min_clearance = min(min_clearance, perp_distance)
-                
-                if perp_distance < (self.robot_width/2 + self.min_clearance):
-                    path_clear = False
-        
-        if path_clear:
-            # Direct path is clear
-            segment = PathSegment(
-                start=np.array([0, 0, 0]),
-                end=direct_vector,
-                width=self.robot_width,
-                clearance=min_clearance,
-                cost=direct_distance
-            )
-            path_segments.append(segment)
-        else:
-            # Need to route around obstacles
-            # Simple workaround: find gap between obstacles
-            path_segments = self._find_alternative_path(
-                tag_pos, obstacles, cost_map, start_u, start_v, goal_u, goal_v
-            )
-        
-        return path_segments if path_segments else None
-    
-    def _find_alternative_path(self, goal_pos: np.ndarray,
-                              obstacles: List[Obstacle],
-                              cost_map: np.ndarray,
-                              start_u: int, start_v: int,
-                              goal_u: int, goal_v: int) -> Optional[List[PathSegment]]:
-        """Find alternative path when direct path is blocked"""
-        # Simplified: just return None to indicate no path found
-        # In full implementation, would use A* or RRT
-        return None
+        return [segment]
 
+    @staticmethod
+    def _wrap_angle(angles: np.ndarray) -> np.ndarray:
+        """Vectorized angle wrapping to [-pi, pi]"""
+        return (angles + np.pi) % (2 * np.pi) - np.pi
+    
 
 class GroundAndObstaclePipeline:
     """
@@ -552,52 +500,32 @@ class GroundAndObstaclePipeline:
         return mask
     
     def process_frame(self, depth_map: np.ndarray,
-                     tag_detections: list,
-                     image_shape: tuple) -> dict:
-        """
-        Process single frame to detect ground, obstacles, and plan path
-        
-        Args:
-            depth_map: Depth map from OAK-D (in mm)
-            tag_detections: List of AprilTagDetection objects
-            image_shape: Image dimensions (h, w)
+                        tag_detections: list,
+                        image_shape: tuple) -> dict:
+            """
+            Process single frame for ground and obstacle perception.
+            Path planning is intentionally excluded to maintain separation of concerns.
+            """
+            if self.camera_intrinsics is None:
+                raise ValueError("Camera intrinsics not set")
             
-        Returns:
-            Dictionary with ground_plane, obstacles, and path information
-        """
-        if self.camera_intrinsics is None:
-            raise ValueError("Camera intrinsics not set")
-        
-        # Create tag mask
-        tag_mask = self.create_tag_mask(image_shape, tag_detections)
-        
-        # Detect ground plane
-        ground_plane = self.ground_detector.detect_ground_plane(
-            depth_map, self.camera_intrinsics, tag_mask
-        )
-        
-        # Detect obstacles
-        obstacles = []
-        if ground_plane is not None:
-            obstacles = self.obstacle_detector.detect_obstacles(
-                depth_map, ground_plane, self.camera_intrinsics, tag_mask
+            tag_mask = self.create_tag_mask(image_shape, tag_detections)
+            
+            ground_plane = self.ground_detector.detect_ground_plane(
+                depth_map, self.camera_intrinsics, tag_mask
             )
-        
-        # Plan path to primary tag (closest one)
-        path = None
-        if tag_detections and ground_plane:
-            primary_tag = min(tag_detections, key=lambda t: t.distance)
-            path = self.path_planner.plan_path_to_tag(
-                primary_tag, obstacles, ground_plane,
-                self.camera_intrinsics, image_shape
-            )
-        
-        return {
-            'ground_plane': ground_plane,
-            'obstacles': obstacles,
-            'path': path,
-            'tag_mask': tag_mask
-        }
+            
+            obstacles = []
+            if ground_plane is not None:
+                obstacles = self.obstacle_detector.detect_obstacles(
+                    depth_map, ground_plane, self.camera_intrinsics, tag_mask
+                )
+            
+            return {
+                'ground_plane': ground_plane,
+                'obstacles': obstacles,
+                'tag_mask': tag_mask
+            }
 
 
 if __name__ == "__main__":

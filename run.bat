@@ -11,11 +11,11 @@ if not exist "venv\Scripts\activate.bat" (
 )
 
 REM 2. Activate environment
-echo 🔌 Activating environment...
+echo  Activating environment...
 call venv\Scripts\activate.bat
 
 REM 3. Verify & install dependencies
-echo 📥 Installing/Updating dependencies from requirements.txt...
+echo  Installing/Updating dependencies from requirements.txt...
 pip install -r requirements.txt
 
 echo.

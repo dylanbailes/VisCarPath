@@ -1,9 +1,7 @@
 """
 Main Autonomous Navigation Pipeline
-Integrates OAK-D, AprilTag detection, ground/obstacle detection, 
-Kalman filtering, and MPC control for real-time autonomous navigation
+Integrates perception, state estimation, and control.
 """
-
 import cv2
 import numpy as np
 import time
@@ -13,321 +11,172 @@ from typing import Optional, Dict, Any
 from dataclasses import dataclass
 from enum import Enum
 
-# Import our modules
-from apriltag_detection import OakDAprilTagPipeline, AprilTagDetection
-from ground_obstacle_detection import (
-    GroundAndObstaclePipeline, 
-    GroundPlane, 
-    Obstacle,
-    PathSegment
-)
+from apriltag_detection import OakDAprilTagPipeline
+from ground_obstacle_detection import GroundAndObstaclePipeline
 from kalman_filter import ExtendedKalmanFilter, TagMeasurementFusion, VehicleState
-from mpc_controller import PathFollowingController, MPCConfig
-
+from mpc_controller import PathFollowingController, ControllerConfig
 
 class NavigationState(Enum):
-    """Navigation system states"""
     IDLE = "idle"
-    INITIALIZING = "initializing"
     DETECTING_TAGS = "detecting_tags"
-    PLANNING_PATH = "planning_path"
     NAVIGATING = "navigating"
     OBSTRUCTED = "obstructed"
     TARGET_REACHED = "target_reached"
-    ERROR = "error"
-
 
 @dataclass
 class NavigationCommand:
-    """Control command output from navigation system"""
-    acceleration: float  # m/s²
-    steering_rate: float  # rad/s
-    target_velocity: float  # m/s
-    timestamp: float  # Unix timestamp
-
+    acceleration: float
+    steering_rate: float
+    target_velocity: float
+    timestamp: float
 
 class AutonomousNavigator:
-    """
-    Complete autonomous navigation system integrating all components
-    
-    Architecture:
-    1. OAK-D Lite captures RGB + Depth frames
-    2. AprilTag detector identifies ground-mounted tags
-    3. Ground plane detector identifies navigable terrain
-    4. Obstacle detector finds obstacles above ground plane
-    5. Path planner creates collision-free path to target tag
-    6. Kalman filter estimates vehicle state from tag observations
-    7. MPC controller computes optimal control inputs
-    """
-    
-    def __init__(self, 
-                 robot_width: float = 0.5,
-                 target_tag_id: Optional[int] = None):
-        """
-        Initialize complete navigation system
+    def __init__(self, robot_width: float = 0.5, target_tag_id: Optional[int] = None):
+        self.oak_pipeline = OakDAprilTagPipeline()
+        self.ground_pipeline = GroundAndObstaclePipeline(robot_width=robot_width)
         
-        Args:
-            robot_width: Robot width in meters (for collision avoidance)
-            target_tag_id: Specific tag ID to navigate to (None = closest visible)
-        """
-        print("Initializing Autonomous Navigation System...")
+        initial_state = VehicleState(x=0, y=0, theta=0, v=0, omega=0)
+        self.ekf = ExtendedKalmanFilter(initial_state=initial_state, process_noise=0.1, measurement_noise=0.5)
+        self.tag_fusion = TagMeasurementFusion(self.ekf)
         
-                # Cache to prevent processing frames twice
+        ctrl_config = ControllerConfig(dt=0.1, max_velocity=1.5, max_acceleration=0.8)
+        self.controller = PathFollowingController(ctrl_config)
+        
+        self.navigation_state = NavigationState.IDLE
+        self.current_command = NavigationCommand(0, 0, 0, time.time())
+        self.target_tag_id = target_tag_id
+        self.tag_map: Dict[int, tuple] = {}
+        
         self.last_rgb = None
         self.last_depth = None
         self.last_tags = []
-        # Initialize OAK-D pipeline
-        self.oak_pipeline = OakDAprilTagPipeline()
-        
-        # Initialize ground/obstacle detection
-        self.ground_pipeline = GroundAndObstaclePipeline(robot_width=robot_width)
-        
-        # Initialize Kalman filter
-        initial_state = VehicleState(x=0, y=0, theta=0, v=0, omega=0)
-        self.ekf = ExtendedKalmanFilter(
-            initial_state=initial_state,
-            process_noise=0.1,
-            measurement_noise=0.5
-        )
-        self.tag_fusion = TagMeasurementFusion(self.ekf)
-        
-        # Initialize MPC controller
-        mpc_config = MPCConfig(
-            horizon=10,
-            dt=0.1,
-            max_velocity=1.5,
-            max_acceleration=0.8,
-            obstacle_safety_margin=0.3
-        )
-        self.mpc_controller = PathFollowingController(mpc_config)
-        
-        # System state
-        self.navigation_state = NavigationState.IDLE
-        self.current_command = NavigationCommand(0, 0, 0, time.time())
-        
-        # Target configuration
-        self.target_tag_id = target_tag_id
-        
-        # Performance metrics
         self.fps = 0
         self.last_frame_time = time.time()
         self.frame_count = 0
-        
-        # Known tag map (can be pre-populated or learned online)
-        self.tag_map: Dict[int, tuple] = {}
-        
-        print("Initialization complete.")
-        
+
     def set_target_tag(self, tag_id: int):
-        """Set specific target tag to navigate to"""
         self.target_tag_id = tag_id
-        print(f"Target tag set to ID: {tag_id}")
-        
+
     def add_known_tag(self, tag_id: int, x: float, y: float, theta: float = 0):
-        """Add known tag position to map"""
         self.tag_map[tag_id] = (x, y, theta)
         self.tag_fusion.add_tag_to_map(tag_id, x, y, theta)
-        
+
     def start(self):
-        """Start the navigation system"""
-        print("Starting OAK-D device...")
         self.oak_pipeline.start()
-        
-        # Set camera intrinsics for ground pipeline
-        ratio = 480 / 1080  # Based on our RGB resolution
+        ratio = 480 / 1080
         fx = self.oak_pipeline.april_detector.fx * ratio
         fy = self.oak_pipeline.april_detector.fy * ratio
         cx = self.oak_pipeline.april_detector.cx * ratio
         cy = self.oak_pipeline.april_detector.cy * ratio
-        
         self.ground_pipeline.set_camera_intrinsics(fx, fy, cx, cy)
-        
         self.navigation_state = NavigationState.DETECTING_TAGS
-        print("Navigation system started.")
-        
+
     def stop(self):
-        """Stop the navigation system"""
-        print("Stopping navigation system...")
         if self.oak_pipeline.device:
             self.oak_pipeline.stop()
         self.navigation_state = NavigationState.IDLE
-        print("Navigation system stopped.")
-        
+
     def process_frame(self) -> Optional[NavigationCommand]:
-        """
-        Process single frame and compute control command
-        
-        Returns:
-            NavigationCommand or None if processing failed
-        """
-        frame_start = time.time()
-        
-        # Get frame data from OAK-D
-        rgb_frame, depth_frame, timestamp = self.oak_pipeline.get_frame_data()
-        
+        rgb_frame, depth_frame, _ = self.oak_pipeline.get_frame_data()
         if rgb_frame is None or depth_frame is None:
             return None
-        
+            
         h, w = rgb_frame.shape[:2]
-        
-        # Detect AprilTags
         tag_detections = self.oak_pipeline.detect_tags_in_frame(rgb_frame, depth_frame)
-        self.last_rgb = rgb_frame
-        self.last_depth = depth_frame
-        self.last_tags = tag_detections
+        self.last_rgb, self.last_depth, self.last_tags = rgb_frame, depth_frame, tag_detections
         
-        # Learn new tag positions if not in map
-        for tag in tag_detections:
-            if tag.tag_id not in self.tag_map:
-                # Estimate tag world position from current state
-                state = self.ekf.get_state()
-                tag_pos_cam = tag.pose[:3, 3]
-                
-                # Simple estimation: assume tag is at camera heading direction
-                tag_world_x = state.x + tag_pos_cam[2] * np.cos(state.theta)
-                tag_world_y = state.y + tag_pos_cam[2] * np.sin(state.theta)
-                
-                self.add_known_tag(tag.tag_id, tag_world_x, tag_world_y)
-                print(f"Learned tag {tag.tag_id} at ({tag_world_x:.2f}, {tag_world_y:.2f})")
-        
-        # Select target tag
+        # 1. TARGET SELECTION
         target_tag = None
         if self.target_tag_id is not None:
-            for tag in tag_detections:
-                if tag.tag_id == self.target_tag_id:
-                    target_tag = tag
-                    break
+            target_tag = next((t for t in tag_detections if t.tag_id == self.target_tag_id), None)
         elif tag_detections:
-            # Use closest tag as target
             target_tag = min(tag_detections, key=lambda t: t.distance)
+            self.target_tag_id = target_tag.tag_id
+            
+        # 2. STATIC LANDMARK FILTERING
+        # Exclude target tag from mapping and EKF to prevent moving target from corrupting localization
+        static_tags = [t for t in tag_detections if t.tag_id != self.target_tag_id]
         
-        # Process ground and obstacles
-        frame_data = self.ground_pipeline.process_frame(
-            depth_frame, tag_detections, (h, w)
-        )
-        
+        for tag in static_tags:
+            if tag.tag_id not in self.tag_map:
+                state = self.ekf.get_state()
+                cam_x, cam_z = tag.pose[0, 3], tag.pose[2, 3]
+                # 2D rotation matching TagMeasurementFusion logic
+                tag_world_x = state.x + cam_z * np.cos(state.theta) - cam_x * np.sin(state.theta)
+                tag_world_y = state.y + cam_z * np.sin(state.theta) + cam_x * np.cos(state.theta)
+                self.add_known_tag(tag.tag_id, tag_world_x, tag_world_y)
+                
+        # 3. PERCEPTION (Ground & Obstacles)
+        frame_data = self.ground_pipeline.process_frame(depth_frame, tag_detections, (h, w))
         ground_plane = frame_data['ground_plane']
         obstacles = frame_data['obstacles']
-        path = frame_data['path']
         
-        # Update Kalman filter with tag measurements
-        if tag_detections:
-            self.tag_fusion.update_ekf_with_tags(tag_detections)
-        
-        # Predict next state
-        self.ekf.predict(dt=0.1, control_input=(
-            self.current_command.acceleration,
-            self.current_command.steering_rate
-        ))
-        
-        # Get current state estimate
+        # 4. STATE ESTIMATION (EKF)
+        if static_tags:
+            self.tag_fusion.update_ekf_with_tags(static_tags)
+            
+        self.ekf.predict(dt=0.1, control_input=(self.current_command.acceleration, self.current_command.steering_rate))
         current_state = self.ekf.get_state()
         
-        # Plan path if needed
-        if target_tag and ground_plane and path is None:
-            # Re-plan path to target
+        # 5. REACTIVE PATH PLANNING (Camera-frame)
+        path = None
+        if target_tag and ground_plane:
             path = self.ground_pipeline.path_planner.plan_path_to_tag(
                 target_tag, obstacles, ground_plane,
                 self.ground_pipeline.camera_intrinsics, (h, w)
             )
-        
-        # Determine navigation state
+            
+        # 6. STATE MACHINE
         if target_tag is None:
             self.navigation_state = NavigationState.DETECTING_TAGS
-        elif obstacles and len(obstacles) > 0:
-            closest_obstacle = min(obstacles, key=lambda o: o.distance)
-            if closest_obstacle.distance < 1.0:
-                self.navigation_state = NavigationState.OBSTRUCTED
-            else:
-                self.navigation_state = NavigationState.NAVIGATING
-        elif target_tag and target_tag.distance < 0.5:
+        elif target_tag.distance < 0.5:
             self.navigation_state = NavigationState.TARGET_REACHED
+        elif obstacles:
+            closest_obs = min(obstacles, key=lambda o: o.distance)
+            self.navigation_state = NavigationState.OBSTRUCTED if closest_obs.distance < 1.0 else NavigationState.NAVIGATING
         else:
             self.navigation_state = NavigationState.NAVIGATING
-        
-        # Compute control command
-        if self.navigation_state in [NavigationState.NAVIGATING, NavigationState.PLANNING_PATH]:
-            # Update MPC with current state
-            state_array = np.array([
-                current_state.x,
-                current_state.y,
-                current_state.theta,
-                current_state.v,
-                0.0  # Steering angle (not estimated)
-            ])
-            self.mpc_controller.update_state(state_array)
             
-            # Convert path segments to format MPC expects
+        # 7. CONTROL COMPUTATION
+        if self.navigation_state == NavigationState.NAVIGATING:
+            state_array = np.array([current_state.x, current_state.y, current_state.theta, current_state.v, 0.0])
+            self.controller.update_state(state_array)
+            
             if path:
-                mpc_path = []
-                for seg in path:
-                    mpc_path.append(seg)
-                
                 try:
-                    accel, steer = self.mpc_controller.compute_control(
-                        mpc_path if mpc_path else [],
-                        obstacles
-                    )
-                except Exception as e:
-                    # Fallback to zero commands if controller math fails
-                    print(f"[MPC Fallback] {e}")
+                    accel, steer = self.controller.compute_control(path, obstacles)
+                except Exception:
                     accel, steer = 0.0, 0.0
-                
-                # Limit commands based on state
-                if self.navigation_state == NavigationState.OBSTRUCTED:
-                    accel = max(-0.5, accel)  # Gentle braking
-                
-                self.current_command = NavigationCommand(
-                    acceleration=accel,
-                    steering_rate=steer,
-                    target_velocity=current_state.v + accel * 0.1,
-                    timestamp=time.time()
-                )
+                self.current_command = NavigationCommand(accel, steer, current_state.v + accel * 0.1, time.time())
             else:
-                # No path available - stop
                 self.current_command = NavigationCommand(0, 0, 0, time.time())
-                
-        elif self.navigation_state == NavigationState.TARGET_REACHED:
-            # Stop at target
+        else:
             self.current_command = NavigationCommand(0, 0, 0, time.time())
             
-        elif self.navigation_state == NavigationState.OBSTRUCTED:
-            # Slow down or stop
-            self.current_command = NavigationCommand(
-                acceleration=-0.3,
-                steering_rate=0,
-                target_velocity=max(0, current_state.v - 0.3),
-                timestamp=time.time()
-            )
-        else:
-            # Default: stop
-            self.current_command = NavigationCommand(0, 0, 0, time.time())
-        
-        # Update FPS
+        self._update_fps()
+        return self.current_command
+
+    def _update_fps(self):
         self.frame_count += 1
         if time.time() - self.last_frame_time >= 1.0:
             self.fps = self.frame_count
             self.frame_count = 0
             self.last_frame_time = time.time()
-        
-        return self.current_command
-    
+
     def get_diagnostics(self) -> Dict[str, Any]:
-        """Get system diagnostics"""
         state = self.ekf.get_state()
-        
         return {
-            'navigation_state': self.navigation_state.value,
-            'estimated_position': (state.x, state.y),
-            'estimated_heading': np.degrees(state.theta),
-            'estimated_velocity': state.v,
-            'target_tag_id': self.target_tag_id,
-            'known_tags': len(self.tag_map),
+            'state': self.navigation_state.value,
+            'pos': (state.x, state.y),
+            'heading': np.degrees(state.theta),
+            'vel': state.v,
+            'target_id': self.target_tag_id,
             'fps': self.fps,
-            'control_acceleration': self.current_command.acceleration,
-            'control_steering_rate': self.current_command.steering_rate
+            'cmd_a': self.current_command.acceleration,
+            'cmd_s': self.current_command.steering_rate
         }
-    
+
+    # ... [run_visualization and main remain unchanged] ...
     def run_visualization(self, show_diagnostics: bool = True):
         """Run navigation with stable visualization"""
         print("Starting visualization mode. Press 'q' to quit.")

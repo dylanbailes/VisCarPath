@@ -1,20 +1,22 @@
 @echo off
-echo ========================================
-echo  VisCarPath Environment Repair
-echo ========================================
+echo VisCarPath Environment Setup
+echo ============================
 echo.
 
+REM Check if virtual environment exists
 if not exist "venv\Scripts\activate.bat" (
-    echo Creating fresh virtual environment...
+    echo Creating virtual environment...
     python -m venv venv
-    call venv\Scripts\activate.bat
-) else (
-    call venv\Scripts\activate.bat
 )
 
-echo Installing/Updating all dependencies...
-pip install -r requirements.txt --upgrade
+REM Activate the environment for this session
+call venv\Scripts\activate.bat
+
+REM Install or update dependencies
+echo Installing dependencies from requirements.txt...
+pip install -r requirements.txt
 
 echo.
-echo Environment ready! Close this window and run `run.bat`.
+echo Environment setup complete.
+echo You can now run your script manually when the OAK-D is connected.
 pause
