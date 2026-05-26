@@ -488,15 +488,25 @@ class GroundAndObstaclePipeline:
     
     def create_tag_mask(self, image_shape: tuple, 
                        tag_detections: list) -> np.ndarray:
-        """Create binary mask marking tag regions"""
+        """
+        Create binary mask marking tag regions to exclude them from 
+        ground plane estimation and obstacle detection.
+        """
         h, w = image_shape
         mask = np.zeros((h, w), dtype=np.uint8)
         
         for tag in tag_detections:
-            # Could draw tag bounding boxes here
-            # For now, just return empty mask
-            pass
+            if hasattr(tag, 'corners') and tag.corners is not None:
+                # pupil_apriltags returns corners as (4, 2) float array of (x, y)
+                # OpenCV fillPoly requires int32 and shape (-1, 1, 2)
+                pts = np.array(tag.corners, dtype=np.int32).reshape((-1, 1, 2))
+                cv2.fillPoly(mask, [pts], 255)
         
+        # Dilate the mask to cover the tag's black border and stereo depth edge-noise
+        if np.any(mask > 0):
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
+            mask = cv2.dilate(mask, kernel, iterations=1)
+            
         return mask
     
     def process_frame(self, depth_map: np.ndarray,

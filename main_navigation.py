@@ -297,9 +297,9 @@ def main():
                 
                 if command:
                     diag = navigator.get_diagnostics()
-                    print(f"[{diag['navigation_state']}] "
-                          f"Pos: ({diag['estimated_position'][0]:.2f}, {diag['estimated_position'][1]:.2f}), "
-                          f"Cmd: a={command.acceleration:.3f}, s={command.steering_rate:.3f}")
+                    print(f"[{diag['state']}] "
+                        f"Pos: ({diag['pos'][0]:.2f}, {diag['pos'][1]:.2f}), "
+                        f"Cmd: a={command.acceleration:.3f}, s={command.steering_rate:.3f}")
                 
                 time.sleep(0.1)
         except KeyboardInterrupt:

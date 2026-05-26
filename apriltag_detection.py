@@ -10,8 +10,6 @@ from pupil_apriltags import Detector
 from dataclasses import dataclass
 from typing import Optional, List
 
-# Completely disable depthai to avoid bus errors on this system
-DEPTHAI_AVAILABLE = True
 
 
 @dataclass
@@ -20,10 +18,11 @@ class AprilTagDetection:
     tag_id: int
     tag_family: str
     center: tuple  # (u, v) in pixel coordinates
+    corners: np.ndarray  # 4x2 array of corner pixel coordinates (x, y)
     pose: np.ndarray  # 4x4 transformation matrix (camera to tag)
     distance: float  # Distance from camera in meters
     bearing: float  # Angle relative to camera center in radians
-    confidence: float
+    confidence: float  # Detection confidence (decision margin from pupil_apriltags)
 
 
 class AprilTagDetector:
@@ -59,7 +58,7 @@ class AprilTagDetector:
         )
         self.tag_family = tag_family
         
-        # Camera intrinsics (will be updated from OAK-D)
+        # Camera intrinsics fall back to typical OAK-D values, but will be updated from calibration
         self.fx = 800.0  # Approximate focal length
         self.fy = 800.0
         self.cx = 640.0  # Principal point
@@ -91,7 +90,6 @@ class AprilTagDetector:
             [0, self.fy, self.cy], 
             [0, 0, 1]
         ])
-        dist_coeffs = np.zeros(4)  # OAK-D Lite distortion is negligible at center
         
         # 3. 3D Object Points (centered square, in meters)
         half_size = self.tag_size / 2.0
@@ -108,7 +106,7 @@ class AprilTagDetector:
             
             # 4. Solve PnP
             success, rvec, tvec = cv2.solvePnP(
-                obj_points, img_points, K, dist_coeffs,
+                obj_points, img_points, K, None,
                 flags=cv2.SOLVEPNP_IPPE_SQUARE
             )
             
@@ -126,12 +124,13 @@ class AprilTagDetector:
                     tag_id=result.tag_id,
                     tag_family=self.tag_family,
                     center=center,
+                    corners=result.corners,  # Pass the raw 4x2 corner array
                     pose=pose,
                     distance=distance,
                     bearing=bearing,
                     confidence=result.decision_margin
                 ))
-                
+                    
         return detections
     
     def filter_ground_tags(self, detections: List[AprilTagDetection],
@@ -187,12 +186,7 @@ class OakDAprilTagPipeline:
         self.q_depth = None
         
     def setup_oakd_pipeline(self):
-        """Configure OAK-D Lite stereo depth + RGB pipeline"""
-        if not DEPTHAI_AVAILABLE:
-            print("DepthAI not available. Using simulated camera feed.")
-            self.pipeline = None
-            return None
-            
+        "Configure OAK-D Lite stereo depth + RGB pipeline"
         self.pipeline = dai.Pipeline()
         
         # 1. Define sources (RGB + 2 Mono cameras for depth)
@@ -252,36 +246,26 @@ class OakDAprilTagPipeline:
         return self.pipeline
     
     def start(self):
-        """Start OAK-D device and pipeline"""
-        if not DEPTHAI_AVAILABLE:
-            print("Running in simulation mode without OAK-D hardware.")
-            return
-            
+
+        "Start OAK-D device and pipeline"
         if self.pipeline is None:
             self.setup_oakd_pipeline()
         
         if self.pipeline is None:
             return
 
-        try:
-            # Try USB 3.0 first
-            print("Attempting USB 3.0 connection...")
-            self.device = dai.Device(self.pipeline, maxUsbSpeed=dai.UsbSpeed.SUPER)
-            print("✅ Connected via USB 3.0!")
-        except RuntimeError as e:
-            # Windows USB stack often fails the initial StereoDepth handshake
-            print(f"⚠️ USB 3.0 handshake failed ({e}). Falling back to USB 2.0...")
-            self.device = dai.Device(self.pipeline, usb2Mode=True)
-            print("✅ Connected via USB 2.0 (stable for testing)")
+        # Force USB 2.0 connection for stability
+        print("Connecting via USB 2.0 (forced for stability)...")
+        self.device = dai.Device(self.pipeline, usb2Mode=True)
+        print("✅ Connected via USB 2.0!")
 
-            self.q_rgb = self.device.getOutputQueue(name="rgb", maxSize=1, blocking=False)
-            self.q_depth = self.device.getOutputQueue(name="depth", maxSize=1, blocking=False)
-        # Get camera intrinsics from calibration
+        # Initialize output queues (must happen AFTER device connection)
+        self.q_rgb = self.device.getOutputQueue(name="rgb", maxSize=1, blocking=False)
+        self.q_depth = self.device.getOutputQueue(name="depth", maxSize=1, blocking=False)
+
         # Get camera intrinsics from calibration
         calib = self.device.readCalibration()
-        # CRITICAL: Explicitly request intrinsics for the 640x480 preview resolution
         intrinsics = calib.getCameraIntrinsics(dai.CameraBoardSocket.CAM_A, 640, 480)
-
         fx = intrinsics[0][0]
         fy = intrinsics[1][1]
         cx = intrinsics[0][2]
@@ -291,34 +275,48 @@ class OakDAprilTagPipeline:
         print(f"OAK-D initialized with intrinsics: fx={fx:.1f}, fy={fy:.1f}, cx={cx:.1f}, cy={cy:.1f}")
         
     def get_frame_data(self):
-        """Get synchronized RGB and depth frames (non-blocking, drops stale frames)"""
-        if not DEPTHAI_AVAILABLE or self.q_rgb is None or self.q_depth is None:
-            return self._get_simulated_frame()
+        """
+        Get synchronized RGB and depth frames.
+        - Device-side is non-blocking (drops stale frames to prevent latency).
+        - Host-side is blocking (ensures RGB and Depth are properly paired).
+        - Includes defensive timeouts to prevent robot 'brain death' on USB drops.
+        """
+        if self.q_rgb is None or self.q_depth is None:
+            raise RuntimeError("OAK-D queues not initialized. Hardware connection failed.")
             
-        # BLOCKING wait for synchronized frames (safe now that we cache results)
+        try:
+            # Host-side blocking wait with a timeout.
+            # If the camera stalls or USB drops, we abort after 1 second 
+            # instead of freezing the navigation stack forever.
+            rgb_packet = self.q_rgb.get(blocking=True, timeout=1.0)
+            depth_packet = self.q_depth.get(blocking=True, timeout=1.0)
+            
+        except RuntimeError as e:
+            # Catches device disconnects, XLink errors, or pipeline crashes
+            print(f"⚠️ OAK-D Pipeline Error (USB drop or crash): {e}")
+            return None, None, None
+        except Exception as e:
+            print(f"⚠️ Unexpected Queue Error: {e}")
+            return None, None, None
 
-        rgb_packet = self.q_rgb.get()
-        depth_packet = self.q_depth.get()
-        # Only process if we have BOTH frames (keeps them synced)
-        if rgb_packet is not None and depth_packet is not None:
+        # Safety check (though timeout should handle empty queues)
+        if rgb_packet is None or depth_packet is None:
+            return None, None, None
+            
+        try:
             rgb_frame = rgb_packet.getCvFrame()
             depth_frame = depth_packet.getFrame()  # Depth in mm
+        except Exception as e:
+            print(f"⚠️ Frame extraction failed: {e}")
+            return None, None, None
             
-            if len(rgb_frame.shape) == 3 and rgb_frame.shape[2] == 3:
-                rgb_frame = cv2.cvtColor(rgb_frame, cv2.COLOR_BGR2RGB)
+        # Ensure RGB is in standard OpenCV format
+        if len(rgb_frame.shape) == 3 and rgb_frame.shape[2] == 3:
+            # DepthAI returns RGB if configured, but safe to ensure BGR->RGB if needed
+            # (Your pipeline sets ColorOrder.RGB, so it's already RGB, but we ensure shape)
+            pass 
             
-            return rgb_frame, depth_frame, rgb_packet.getTimestampDevice()
-        
-        # Return last known good data or skip
-        return None, None, None
-    
-    def _get_simulated_frame(self):
-        """Generate simulated frame data for testing without hardware"""
-        # Create a blank RGB image
-        rgb_frame = np.zeros((720, 1280, 3), dtype=np.uint8)
-        # Create a blank depth image (all zeros = no depth)
-        depth_frame = np.zeros((720, 1280), dtype=np.uint16)
-        return rgb_frame, depth_frame, 0.0
+        return rgb_frame, depth_frame, rgb_packet.getTimestampDevice()
     
     def detect_tags_in_frame(self, rgb_frame: np.ndarray, depth_frame: np.ndarray) -> List[AprilTagDetection]:
         """
@@ -330,7 +328,7 @@ class OakDAprilTagPipeline:
         # Run the full detection + PnP pipeline
         detections = self.april_detector.detect_tags(gray, depth_frame)
         
-        # 🔥 CRITICAL FIX: Return ALL detections for now
+        # CRITICAL FIX: Return ALL detections for now
         # (Bypasses filter_ground_tags() which was dropping 100% of tags due to strict pitch math)
         return detections
     
