@@ -1,4 +1,4 @@
-echo off
+@echo off
 echo ========================================
 echo  VisCarPath Navigation Launcher
 echo ========================================
