@@ -32,7 +32,7 @@ class AprilTagDetector:
     """
     
     def __init__(self, tag_family: str = "tag36h11", 
-                 quad_decimate: float = 2.0,
+                 quad_decimate: float = 1.0,
                  quad_sigma: float = 0.0):
         """
         Initialize AprilTag detector
@@ -54,7 +54,9 @@ class AprilTagDetector:
             families=tag_family,
             nthreads=1,
             quad_decimate=quad_decimate,
-            quad_sigma=quad_sigma
+            quad_sigma=quad_sigma,
+            refine_edges=True,
+            decode_sharpening=0.25
         )
         self.tag_family = tag_family
         
@@ -65,7 +67,7 @@ class AprilTagDetector:
         self.cy = 360.0
         
         # Tag size in meters (should be configured based on actual tags)
-        self.tag_size = 0.04  # 4cm standard AprilTag
+        self.tag_size = 0.08  # 8cm standard AprilTag
 
         
     def set_camera_intrinsics(self, fx: float, fy: float, cx: float, cy: float):
@@ -200,14 +202,13 @@ class OakDAprilTagPipeline:
         stereo = self.pipeline.create(dai.node.StereoDepth)
         
         # 2. RGB camera configuration
-        # ... existing cam_rgb configuration ...
         cam_rgb.setPreviewSize(640, 480)
         cam_rgb.setResolution(dai.ColorCameraProperties.SensorResolution.THE_1080_P)
 
         # CRITICAL: Lock autofocus for stable PnP calculations
         # 130 on the 0-255 scale roughly locks focus between 1m and infinity for the OAK-D AF module
-        cam_rgb.initialControl.setAutofocusMode(dai.CameraControl.AutoFocusMode.OFF)
-        cam_rgb.initialControl.setManualFocus(130) 
+        cam_rgb.initialControl.setAutoFocusMode(dai.CameraControl.AutoFocusMode.CONTINUOUS_VIDEO)
+        # cam_rgb.initialControl.setManualFocus(130) 
         cam_rgb.setInterleaved(False)
         cam_rgb.setColorOrder(dai.ColorCameraProperties.ColorOrder.RGB)
         cam_rgb.setFps(15)
@@ -220,15 +221,13 @@ class OakDAprilTagPipeline:
         mono_right.setBoardSocket(dai.CameraBoardSocket.RIGHT)
         
         # 4. Stereo depth configuration
-        # 4. Stereo depth configuration (optimized for Windows USB stability)
-                # 4. Stereo depth configuration (ORDER MATTERS!)
         stereo.setDefaultProfilePreset(dai.node.StereoDepth.PresetMode.DEFAULT)
         stereo.setOutputSize(640, 480)
         stereo.setRectifyEdgeFillColor(0)
         
         # CRITICAL: Must be set AFTER the preset, otherwise it gets overwritten!
         stereo.setDepthAlign(dai.CameraBoardSocket.RGB)
-        stereo.setLeftRightCheck(True)  # REQUIRED for RGB/CENTER alignment
+        stereo.setLeftRightCheck(True)
         
         # Disable heavy features to save USB bandwidth
         stereo.setExtendedDisparity(False)
@@ -246,12 +245,7 @@ class OakDAprilTagPipeline:
         # 7. Link camera previews to outputs
         cam_rgb.preview.link(xout_rgb.input)
         stereo.depth.link(xout_depth.input)
-        
-        # Add IMU node (USB 2.0 safe batching configured internally)
-        from imu_integration import ThreadedIMU
-        self.use_rotation_vector = True  # Set False if BMI270
-        ThreadedIMU.create_imu_node(self.pipeline, self.use_rotation_vector)
-        
+
         return self.pipeline
     
     def start(self):
@@ -262,11 +256,9 @@ class OakDAprilTagPipeline:
         
         if self.pipeline is None:
             return
-
-        # Force USB 2.0 connection for stability
-        print("Connecting via USB 2.0 (forced for stability)...")
+        
         self.device = dai.Device(self.pipeline, usb2Mode=True)
-        print("✅ Connected via USB 2.0!")
+        print("Connected via USB 2.0!")
 
         # Initialize output queues (must happen AFTER device connection)
         self.q_rgb = self.device.getOutputQueue(name="rgb", maxSize=1, blocking=False)
@@ -297,15 +289,15 @@ class OakDAprilTagPipeline:
             # Host-side blocking wait with a timeout.
             # If the camera stalls or USB drops, we abort after 1 second 
             # instead of freezing the navigation stack forever.
-            rgb_packet = self.q_rgb.get(blocking=True, timeout=1.0)
-            depth_packet = self.q_depth.get(blocking=True, timeout=1.0)
+            rgb_packet = self.q_rgb.get()
+            depth_packet = self.q_depth.get()
             
         except RuntimeError as e:
             # Catches device disconnects, XLink errors, or pipeline crashes
-            print(f"⚠️ OAK-D Pipeline Error (USB drop or crash): {e}")
+            print(f"OAK-D Pipeline Error (USB drop or crash): {e}")
             return None, None, None
         except Exception as e:
-            print(f"⚠️ Unexpected Queue Error: {e}")
+            print(f"Unexpected Queue Error: {e}")
             return None, None, None
 
         # Safety check (though timeout should handle empty queues)
@@ -316,7 +308,7 @@ class OakDAprilTagPipeline:
             rgb_frame = rgb_packet.getCvFrame()
             depth_frame = depth_packet.getFrame()  # Depth in mm
         except Exception as e:
-            print(f"⚠️ Frame extraction failed: {e}")
+            print(f"Frame extraction failed: {e}")
             return None, None, None
             
         # Ensure RGB is in standard OpenCV format
