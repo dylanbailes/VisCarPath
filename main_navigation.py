@@ -54,8 +54,6 @@ class AutonomousNavigator:
         self.last_frame_time = time.time()
         self.frame_count = 0
         
-        from imu_integration import ThreadedIMU
-        self.imu = ThreadedIMU(use_rotation_vector=True)
 
 
     def set_target_tag(self, tag_id: int):
@@ -67,13 +65,11 @@ class AutonomousNavigator:
 
     def start(self):
         self.oak_pipeline.start()
-        if self.oak_pipeline.device is not None:
-            self.imu.start(self.oak_pipeline.device)
         ratio = 480 / 1080
-        fx = self.oak_pipeline.april_detector.fx * ratio
-        fy = self.oak_pipeline.april_detector.fy * ratio
-        cx = self.oak_pipeline.april_detector.cx * ratio
-        cy = self.oak_pipeline.april_detector.cy * ratio
+        fx = self.oak_pipeline.april_detector.fx
+        fy = self.oak_pipeline.april_detector.fy
+        cx = self.oak_pipeline.april_detector.cx
+        cy = self.oak_pipeline.april_detector.cy
         self.ground_pipeline.set_camera_intrinsics(fx, fy, cx, cy)
         self.navigation_state = NavigationState.DETECTING_TAGS
 
@@ -81,7 +77,6 @@ class AutonomousNavigator:
         if self.oak_pipeline.device:
             self.oak_pipeline.stop()
         self.navigation_state = NavigationState.IDLE
-        self.imu.stop()
 
 
     def process_frame(self) -> Optional[NavigationCommand]:
@@ -123,14 +118,13 @@ class AutonomousNavigator:
         if static_tags:
             self.tag_fusion.update_ekf_with_tags(static_tags)
             
-        imu_state = self.imu.get_state()
-        imu_yaw_rate = imu_state[1]  # rad/s from gyroscope/fusion
         accel_cmd = self.current_command.acceleration
+        steer_cmd = self.current_command.steering_rate
 
-        # Predict with measured yaw rate, not commanded steering
+        # Predict using the commanded steering rate (bicycle model)
         self.ekf.predict(
             dt=0.1,
-            control_input=(accel_cmd, imu_yaw_rate)
+            control_input=(accel_cmd, steer_cmd)
         )
         
         current_state = self.ekf.get_state()
