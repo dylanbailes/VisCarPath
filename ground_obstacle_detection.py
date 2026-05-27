@@ -216,8 +216,8 @@ class ObstacleDetector:
     """
     
     def __init__(self,
-                 height_threshold: float = 0.05,  # 5cm above ground
-                 min_obstacle_size: int = 50,  # Minimum pixels
+                 height_threshold: float = 0.1,  # 5cm above ground
+                 min_obstacle_size: int = 150,  # Minimum pixels
                  max_obstacle_distance: float = 5.0):  # Maximum detection range
         """
         Initialize obstacle detector
@@ -328,13 +328,23 @@ class ObstacleDetector:
                 # Get centroid
                 centroid_u, centroid_v = centroids[i]
                 
-                # Get 3D position at centroid
+                # CRITICAL FIX: Safe depth sampling. 
+                # Morphological closing can fill holes, meaning the exact centroid pixel 
+                # might have 0 or invalid depth. 
                 z_centroid = depth_meters[int(centroid_v), int(centroid_u)]
+                
+                if z_centroid <= 0.1 or np.isnan(z_centroid):
+                    # Fallback: get median depth of all valid pixels in this specific blob
+                    component_mask = (labels == i)
+                    valid_depths = depth_meters[component_mask & (depth_meters > 0.1)]
+                    if len(valid_depths) == 0:
+                        continue  # Ghost obstacle from morphological closing, skip it
+                    z_centroid = np.median(valid_depths)
+                    
                 x_centroid = (centroid_u - cx) * z_centroid / fx
                 y_centroid = (centroid_v - cy) * z_centroid / fy
                 
                 position_3d = np.array([x_centroid, y_centroid, z_centroid])
-                
                 # Calculate distance and bearing
                 distance = np.linalg.norm(position_3d)
                 bearing = np.arctan2(x_centroid, z_centroid)
