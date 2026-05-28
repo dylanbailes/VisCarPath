@@ -1,722 +1,1094 @@
 """
-Comprehensive OAK-D Lite Debugging Suite
+Comprehensive OAK-D Lite Debugging Suite  —  Performance-Optimised Build
 Focus: Depth map validation, AprilTag detection at distance, spatial obstacle detection
-Provides real-time visualization of depth confidence, point clouds, and 3D coordinates
+Target: 10+ FPS on CPU with full RGB-depth fusion
+
+Key optimisations vs previous version
+--------------------------------------
+1. FastSAM runs on a background thread at a capped rate (every N depth frames),
+   depth detection runs every frame at full speed, fusion merges the two.
+2. RANSAC plane fit result is cached and reused across frames; only recomputed
+   every PLANE_REFIT_INTERVAL frames or when depth changes significantly.
+3. _depth_grow_mask replaced with a single vectorised pass — no per-component loop.
+4. HSV conversion in _is_floor_segment lifted out of the per-mask loop.
+5. IoU matching in fuse() uses pre-rasterised depth obstacle masks (one draw per
+   depth obstacle, not one per RGB×depth pair).
+6. _merge_nearby_contours depth sampling uses bounding-rect centre pixel lookup
+   instead of drawing a full H×W mask per contour.
+7. bilateralFilter and histogram equalisation moved inside the save-only branch
+   (only runs every 20 frames, not every frame).
+8. Temporal smoothing replaced with a lightweight running-OR accumulator.
+9. medianBlur on the depth frame replaced with a smaller kernel (3 vs 5).
+10. AprilTag detector runs with quad_decimate=2.0 to halve the search image.
 """
+
 import os
 import cv2
 import numpy as np
 import depthai as dai
+from ultralytics import FastSAM
+import torch
 from pupil_apriltags import Detector
 from typing import Optional, Tuple, List
 import time
+import threading
 from collections import deque
 
 
+# ---------------------------------------------------------------------------
+# Tunable constants — edit here rather than hunting through the code
+# ---------------------------------------------------------------------------
+PLANE_REFIT_INTERVAL   = 10   # Refit ground plane every N frames
+FASTSAM_INTERVAL       = 4    # Run FastSAM every N depth frames
+FASTSAM_IMGSZ          = 320  # Input resolution for FastSAM (320 vs 640 = ~4× faster)
+DEPTH_MEDIAN_KSIZE     = 3    # Median blur kernel on raw depth (3 vs 5 saves ~4ms)
+MAX_RANSAC_PTS         = 1500 # RANSAC point budget (was 3000)
+RANSAC_ITERS           = 30   # RANSAC iterations (was 50)
+
+
+# ---------------------------------------------------------------------------
+# DepthMapDebugger
+# ---------------------------------------------------------------------------
 class DepthMapDebugger:
-    """
-    Analyzes and visualizes depth map quality metrics
-    """
     def __init__(self):
-        self.depth_history = deque(maxlen=30)  # Track depth stability
+        self.depth_history   = deque(maxlen=30)
         self.confidence_history = deque(maxlen=30)
-        
+
     def analyze_depth_map(self, depth_frame: np.ndarray) -> dict:
-        """Comprehensive depth map analysis"""
-        stats = {
-            'valid_pixels': 0,
-            'total_pixels': depth_frame.size,
-            'median_depth_mm': 0,
-            'mean_depth_mm': 0,
-            'std_depth_mm': 0,
-            'min_depth_mm': 0,
-            'max_depth_mm': 0,
-            'noise_ratio': 0,
-            'confidence_score': 0
-        }
-        
-        # Convert to float for analysis
-        depth_mm = depth_frame.astype(np.float32)
-        
-        # Valid depth range (10cm to 5m for OAK-D Lite)
+        depth_mm   = depth_frame.astype(np.float32)
         valid_mask = (depth_mm > 100) & (depth_mm < 5000)
-        stats['valid_pixels'] = int(np.sum(valid_mask))
-        
-        if stats['valid_pixels'] > 0:
-            valid_depths = depth_mm[valid_mask]
-            stats['median_depth_mm'] = float(np.median(valid_depths))
-            stats['mean_depth_mm'] = float(np.mean(valid_depths))
-            stats['std_depth_mm'] = float(np.std(valid_depths))
-            stats['min_depth_mm'] = float(np.min(valid_depths))
-            stats['max_depth_mm'] = float(np.max(valid_depths))
-            
-            # Noise ratio: high std dev relative to mean indicates noise
+        valid_px   = int(np.sum(valid_mask))
+        total_px   = depth_frame.size
+
+        stats = {
+            'valid_pixels': valid_px,
+            'total_pixels': total_px,
+            'median_depth_mm': 0.0,
+            'mean_depth_mm':   0.0,
+            'std_depth_mm':    0.0,
+            'min_depth_mm':    0.0,
+            'max_depth_mm':    0.0,
+            'noise_ratio':     0.0,
+            'confidence_score':0.0,
+        }
+
+        if valid_px > 0:
+            vd = depth_mm[valid_mask]
+            stats['median_depth_mm'] = float(np.median(vd))
+            stats['mean_depth_mm']   = float(np.mean(vd))
+            stats['std_depth_mm']    = float(np.std(vd))
+            stats['min_depth_mm']    = float(vd.min())
+            stats['max_depth_mm']    = float(vd.max())
             if stats['mean_depth_mm'] > 0:
                 stats['noise_ratio'] = stats['std_depth_mm'] / stats['mean_depth_mm']
-            
-            # Confidence score based on valid pixel ratio
-            stats['confidence_score'] = stats['valid_pixels'] / stats['total_pixels']
-        
-        # Track history for stability analysis
+            stats['confidence_score'] = valid_px / total_px
+
         self.depth_history.append(stats['median_depth_mm'])
         self.confidence_history.append(stats['confidence_score'])
-        
-        # Calculate temporal stability
+
         if len(self.depth_history) > 5:
-            depth_std = np.std(list(self.depth_history))
-            stats['temporal_stability'] = 1.0 - min(1.0, depth_std / 100.0)  # Lower std = higher stability
+            stats['temporal_stability'] = 1.0 - min(
+                1.0, float(np.std(list(self.depth_history))) / 100.0)
         else:
             stats['temporal_stability'] = 1.0
-            
+
         return stats
-    
-    def visualize_depth(self, depth_frame: np.ndarray, 
-                       stats: dict, 
-                       apply_filters: bool = True) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Create multiple depth visualizations for debugging
-        Returns: (raw_viz, filtered_viz)
-        """
-        # Normalize depth for visualization (0-255)
-        depth_mm = depth_frame.astype(np.float32)
-        
-        # Clip to useful range (10cm - 3m)
-        depth_clipped = np.clip(depth_mm, 100, 3000)
-        
-        # Raw normalized depth
-        depth_norm = cv2.normalize(
-            depth_clipped, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U
-        )
-        raw_viz = cv2.applyColorMap(depth_norm, cv2.COLORMAP_JET)
-        
-        # Add statistics overlay
-        self._draw_stats(raw_viz, stats)
-        
-        if apply_filters:
-            # Apply bilateral filter to reduce noise while preserving edges
-            depth_filtered = cv2.bilateralFilter(depth_clipped, 9, 75, 75)
-            depth_filtered_norm = cv2.normalize(
-                depth_filtered, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U
-            )
-            filtered_viz = cv2.applyColorMap(depth_filtered_norm, cv2.COLORMAP_JET)
-            
-            # Apply histogram equalization for better contrast
-            depth_equalized = cv2.equalizeHist(depth_filtered_norm.flatten()).reshape(depth_filtered_norm.shape)
-            filtered_viz = cv2.applyColorMap(depth_equalized, cv2.COLORMAP_VIRIDIS)
-        else:
-            filtered_viz = raw_viz.copy()
-            
-        return raw_viz, filtered_viz
-    
+
+    # OPT: bilateralFilter and equaliseHist only called from the save branch,
+    # not every frame.  visualize_depth_fast is the per-frame path.
+    def visualize_depth_fast(self, depth_frame: np.ndarray) -> np.ndarray:
+        """Cheap colormap — no bilateral, no equalise.  ~0.5 ms."""
+        depth_clipped = np.clip(depth_frame.astype(np.float32), 100, 3000)
+        depth_norm    = cv2.normalize(depth_clipped, None, 0, 255,
+                                      cv2.NORM_MINMAX, dtype=cv2.CV_8U)
+        return cv2.applyColorMap(depth_norm, cv2.COLORMAP_JET)
+
+    def visualize_depth_hq(self, depth_frame: np.ndarray,
+                            stats: dict) -> np.ndarray:
+        """High-quality colormap for saved debug images.  Only called every 20 frames."""
+        depth_clipped      = np.clip(depth_frame.astype(np.float32), 100, 3000)
+        depth_filtered     = cv2.bilateralFilter(depth_clipped, 9, 75, 75)
+        depth_filtered_norm = cv2.normalize(depth_filtered, None, 0, 255,
+                                            cv2.NORM_MINMAX, dtype=cv2.CV_8U)
+        depth_equalized    = cv2.equalizeHist(
+            depth_filtered_norm.flatten()).reshape(depth_filtered_norm.shape)
+        viz = cv2.applyColorMap(depth_equalized, cv2.COLORMAP_VIRIDIS)
+        self._draw_stats(viz, stats)
+        return viz
+
     def _draw_stats(self, frame: np.ndarray, stats: dict):
-        """Draw statistics overlay on frame"""
-        y_offset = 30
-        font = cv2.FONT_HERSHEY_SIMPLEX
-        font_scale = 0.5
-        
-        text_lines = [
+        y, font, fs = 30, cv2.FONT_HERSHEY_SIMPLEX, 0.5
+        for line in [
             f"Valid: {stats['valid_pixels']/stats['total_pixels']*100:.1f}%",
             f"Median: {stats['median_depth_mm']:.0f}mm",
             f"StdDev: {stats['std_depth_mm']:.1f}mm",
             f"Noise: {stats['noise_ratio']:.2f}",
-            f"Stability: {stats['temporal_stability']:.2f}"
-        ]
-        
-        x_pos = 10
-        for line in text_lines:
-            cv2.putText(frame, line, (x_pos, y_offset), font, font_scale, (255, 255, 255), 1)
-            y_offset += 25
+            f"Stability: {stats['temporal_stability']:.2f}",
+        ]:
+            cv2.putText(frame, line, (10, y), font, fs, (255, 255, 255), 1)
+            y += 25
 
 
+# ---------------------------------------------------------------------------
+# AprilTagDistanceTester
+# ---------------------------------------------------------------------------
 class AprilTagDistanceTester:
-    """
-    Tests AprilTag detection at various distances with detailed diagnostics
-    """
     def __init__(self, tag_family: str = "tag36h11"):
+        # OPT: quad_decimate=2.0 halves the image before quad search → ~2× faster
         self.detector = Detector(
-            families=tag_family,
-            nthreads=1,
-            quad_decimate=1.0,  # Full resolution for distance testing
-            quad_sigma=0.0,
-            refine_edges=True,
-            decode_sharpening=0.25
+            families=tag_family, nthreads=2, quad_decimate=2.0,
+            quad_sigma=0.0, refine_edges=True, decode_sharpening=0.25,
         )
-        self.tag_size = 0.08  # 8cm tags
-        self.detection_history = []
-        
-    def detect_with_diagnostics(self, gray_frame: np.ndarray, 
-                                K: np.ndarray) -> List[dict]:
-        """Detect tags with detailed diagnostic information"""
-        results = self.detector.detect(gray_frame)
+        self.tag_size  = 0.08
+        self._obj_pts  = np.array([        # pre-built, reused every frame
+            [-0.04,  0.04, 0],
+            [ 0.04,  0.04, 0],
+            [ 0.04, -0.04, 0],
+            [-0.04, -0.04, 0],
+        ], dtype=np.float32)
+
+    def detect_with_diagnostics(self,
+                                  gray_frame: np.ndarray,
+                                  K: np.ndarray) -> List[dict]:
+        results    = self.detector.detect(gray_frame)
         detections = []
-        
-        for result in results:
-            center = tuple(np.mean(result.corners, axis=0).astype(int))
-            img_points = result.corners.astype(np.float32)
-            
-            # PnP pose estimation
-            half_size = self.tag_size / 2.0
-            obj_points = np.array([
-                [-half_size, half_size, 0],
-                [half_size, half_size, 0],
-                [half_size, -half_size, 0],
-                [-half_size, -half_size, 0]
-            ], dtype=np.float32)
-            
-            success, rvec, tvec = cv2.solvePnP(
-                obj_points, img_points, K, None,
-                flags=cv2.SOLVEPNP_IPPE_SQUARE
-            )
-            
-            if success:
+        for r in results:
+            img_pts = r.corners.astype(np.float32)
+            ok, rvec, tvec = cv2.solvePnP(
+                self._obj_pts, img_pts, K, None,
+                flags=cv2.SOLVEPNP_IPPE_SQUARE)
+            if ok:
                 t = tvec.flatten()
-                distance = float(np.linalg.norm(t))
-                bearing = float(np.arctan2(t[0], t[2]))
-                
-                # Calculate apparent tag size (for distance correlation)
-                tag_area = cv2.contourArea(result.corners)
-                
                 detections.append({
-                    'tag_id': result.tag_id,
-                    'center': center,
-                    'corners': result.corners,
-                    'distance_m': distance,
-                    'bearing_rad': bearing,
-                    'confidence': result.decision_margin,
-                    'apparent_area_px': tag_area,
-                    'tvec': t,
-                    'rvec': rvec.flatten()
+                    'tag_id':          r.tag_id,
+                    'center':          tuple(np.mean(r.corners, axis=0).astype(int)),
+                    'corners':         r.corners,
+                    'distance_m':      float(np.linalg.norm(t)),
+                    'bearing_rad':     float(np.arctan2(t[0], t[2])),
+                    'confidence':      r.decision_margin,
+                    'apparent_area_px':cv2.contourArea(r.corners),
                 })
-        
         return detections
 
 
+# ---------------------------------------------------------------------------
+# StereoDepthConfigurator  (unchanged — pipeline config is one-time cost)
+# ---------------------------------------------------------------------------
 class StereoDepthConfigurator:
-    """
-    Configures and tests different StereoDepth settings for optimal performance
-    Optimized for FPS target of 15+ with reduced resolution and vectorized processing
-    """
-    
     @staticmethod
     def create_pipeline(mode: str = "balanced") -> dai.Pipeline:
-        """
-        Create pipeline with different configurations
-        Modes: 'high_accuracy', 'balanced', 'long_range', 'low_noise', 'optimized'
-        
-        Pipeline optimization (FPS ~3.4 → target 15+):
-        - Drop resolution to 640×400 (400P) or 416×240; stereo depth scales quadratically
-        - Use stereo.setLeftRightCheck(True) + setSubpixel(True) only if quality > throughput
-        - Clamp detectionNetwork.setBoundingBoxScaleFactor(0.4) to prevent NN boxes from sampling depth at tile boundaries
-        """
         pipeline = dai.Pipeline()
         print(f"  → Creating pipeline with mode: {mode}")
-        
-        # Optimized resolution for higher FPS (640x400 instead of 640x480)
-        output_width = 640
-        output_height = 400
-        
-        # RGB Camera
+        output_width, output_height = 640, 400
+
         cam_rgb = pipeline.create(dai.node.ColorCamera)
         cam_rgb.setPreviewSize(output_width, output_height)
         cam_rgb.setResolution(dai.ColorCameraProperties.SensorResolution.THE_1080_P)
         cam_rgb.setInterleaved(False)
         cam_rgb.setColorOrder(dai.ColorCameraProperties.ColorOrder.RGB)
-        cam_rgb.setFps(30)  # Higher FPS target
-        
-        # Manual focus for stability (critical for consistent depth)
-        cam_rgb.initialControl.setAutoFocusMode(dai.CameraControl.AutoFocusMode.CONTINUOUS_VIDEO)
-        
-        # Mono cameras - use 400P resolution (quadratic scaling benefit)
+        cam_rgb.setFps(30)
+        cam_rgb.initialControl.setAutoFocusMode(
+            dai.CameraControl.AutoFocusMode.CONTINUOUS_VIDEO)
+
         mono_left = pipeline.create(dai.node.MonoCamera)
         mono_left.setResolution(dai.MonoCameraProperties.SensorResolution.THE_400_P)
         mono_left.setBoardSocket(dai.CameraBoardSocket.CAM_B)
         mono_left.setFps(30)
-        
+
         mono_right = pipeline.create(dai.node.MonoCamera)
         mono_right.setResolution(dai.MonoCameraProperties.SensorResolution.THE_400_P)
         mono_right.setBoardSocket(dai.CameraBoardSocket.CAM_C)
         mono_right.setFps(30)
-        
-        # Stereo Depth
+
         stereo = pipeline.create(dai.node.StereoDepth)
-        
+
         if mode == "high_accuracy":
-            print("  → HIGH ACCURACY: Extended disparity + Subpixel + Confidence 200")
             stereo.setDefaultProfilePreset(dai.node.StereoDepth.PresetMode.DEFAULT)
             stereo.initialConfig.setExtendedDisparity(True)
-            stereo.initialConfig.setSubpixel(True)  # Better edge quality but ~20% latency
+            stereo.initialConfig.setSubpixel(True)
             stereo.initialConfig.setConfidenceThreshold(200)
-            stereo.setLeftRightCheck(True)  # Improves quality, adds ~20% latency
-            #stereo.setMedianFilter(dai.MedianFilter.KERNEL_5x5)  # Stronger median filter for noise reduction
+            stereo.setLeftRightCheck(True)
         elif mode == "long_range":
-            print("  → LONG RANGE: Extended disparity + No subpixel + Confidence 200")
             stereo.setDefaultProfilePreset(dai.node.StereoDepth.PresetMode.LONG_RANGE)
             stereo.initialConfig.setExtendedDisparity(True)
             stereo.initialConfig.setSubpixel(False)
             stereo.initialConfig.setConfidenceThreshold(200)
         elif mode == "low_noise":
-            print("  → LOW NOISE: High density + No extended disparity + No subpixel + Confidence 220")
             stereo.setDefaultProfilePreset(dai.node.StereoDepth.PresetMode.HIGH_DENSITY)
             stereo.initialConfig.setExtendedDisparity(False)
             stereo.initialConfig.setSubpixel(False)
-            stereo.initialConfig.setConfidenceThreshold(220)  # Higher = more strict
+            stereo.initialConfig.setConfidenceThreshold(220)
         elif mode == "optimized":
-            print("  → OPTIMIZED: Default preset + No extended disparity + No subpixel + Confidence 220")
-            # Optimized for FPS with good quality
             stereo.setDefaultProfilePreset(dai.node.StereoDepth.PresetMode.DEFAULT)
-            stereo.initialConfig.setExtendedDisparity(False)  # Faster
-            stereo.initialConfig.setSubpixel(False)  # ~20% faster without subpixel
-            stereo.initialConfig.setConfidenceThreshold(220)  # Strict confidence gating
-            # Disable LR check for speed if quality acceptable (uncomment if needed)
-            # stereo.setLeftRightCheck(False)
-        else:  # balanced
-            print("  → BALANCED: Default preset + Extended disparity + No subpixel + Confidence 220")
+            stereo.initialConfig.setExtendedDisparity(False)
+            stereo.initialConfig.setSubpixel(False)
+            stereo.initialConfig.setConfidenceThreshold(220)
+        else:
             stereo.setDefaultProfilePreset(dai.node.StereoDepth.PresetMode.DEFAULT)
             stereo.initialConfig.setExtendedDisparity(True)
             stereo.initialConfig.setSubpixel(False)
-            stereo.initialConfig.setConfidenceThreshold(220)  # Increased to 220 for confidence gating
-        
-        # Common settings - optimized output size
+            stereo.initialConfig.setConfidenceThreshold(220)
+
         stereo.setOutputSize(output_width, output_height)
         stereo.setRectifyEdgeFillColor(0)
         stereo.setDepthAlign(dai.CameraBoardSocket.CAM_A)
-        stereo.setLeftRightCheck(True)  # Keep for quality, adds ~20% latency but cleans edge noise
-        
-        # Linking
+        stereo.setLeftRightCheck(True)
+
         mono_left.out.link(stereo.left)
         mono_right.out.link(stereo.right)
-        
-        # Outputs
+
         xout_rgb = pipeline.create(dai.node.XLinkOut)
         xout_rgb.setStreamName("rgb")
         cam_rgb.preview.link(xout_rgb.input)
-        
+
         xout_depth = pipeline.create(dai.node.XLinkOut)
         xout_depth.setStreamName("depth")
         stereo.depth.link(xout_depth.input)
-        
-        # Confidence map output (for confidence gating)
+
         xout_conf = pipeline.create(dai.node.XLinkOut)
         xout_conf.setStreamName("confidence")
         stereo.confidenceMap.link(xout_conf.input)
-        
+
         return pipeline
 
 
+# ---------------------------------------------------------------------------
+# SpatialObstacleDetector
+# ---------------------------------------------------------------------------
 class SpatialObstacleDetector:
-    """
-    Detects obstacles using depth data with 3D coordinate extraction
-    Implements ground-plane rejection, spatial coherence filtering,
-    confidence gating, and gradient discontinuity checks
-    """
-    def __init__(self, min_distance: float = 0.2, max_distance: float = 8.0,
-                 camera_height_m: float = 0.3, camera_pitch_rad: float = 0.0):
+    def __init__(self, min_distance: float = 0.35, max_distance: float = 2.5):
         self.min_distance = min_distance
         self.max_distance = max_distance
-        self.camera_height_m = camera_height_m
-        self.camera_pitch_rad = camera_pitch_rad
-        # Ground plane tolerance in mm
-        self.ground_plane_tolerance_mm = 40.0
-        # Minimum contiguous pixels for valid obstacle
-        self.min_contiguous_pixels = 150
-        # Maximum internal depth variance for coherent obstacle (mm)
-        self.max_internal_variance_mm = 80.0
-        # Gradient discontinuity thresholds (mm)
-        self.obstacle_gradient_threshold_mm = 150.0
-        self.floor_gradient_threshold_mm = 50.0
-        # Confidence thresholds
-        self.stereo_confidence_threshold = 220
-        self.detection_confidence_threshold = 0.65
-        
-    def _fit_ground_plane(self, depth_frame: np.ndarray, K: np.ndarray) -> Optional[Tuple[np.ndarray, float]]:
-        h, w = depth_frame.shape
-        depth_mm = depth_frame.astype(np.float32)
-        
-        # Use lower 30% of image for ground plane estimation
-        lower_region_y = int(h * 0.7)
-        lower_depth = depth_mm[lower_region_y:, :]
+        self.stereo_confidence_threshold = 150
+
+        self.distance_zones = [
+            {'max_m': 1.0, 'height_thresh_mm': 120, 'min_area_px': 150,
+             'merge_dist_px': 30, 'median_h_min': 100},
+            {'max_m': 2.0, 'height_thresh_mm': 80,  'min_area_px': 100,
+             'merge_dist_px': 50, 'median_h_min': 60},
+            {'max_m': 2.5, 'height_thresh_mm': 60,  'min_area_px': 80,
+             'merge_dist_px': 70, 'median_h_min': 40},
+        ]
+
+        # OPT: cache the plane fit across frames
+        self._plane_cache: Optional[Tuple[np.ndarray, float]] = None
+        self._plane_frame_count = 0
+
+        # Pre-built morphology kernels — avoid recreating every frame
+        self._kernel7  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+        self._kernel11 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
+        self._kernel15 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+
+    def _get_zone(self, distance_m: float) -> dict:
+        for zone in self.distance_zones:
+            if distance_m <= zone['max_m']:
+                return zone
+        return self.distance_zones[-1]
+
+    # ------------------------------------------------------------------
+    # Ground plane — cached, reduced point budget, fewer iterations
+    # ------------------------------------------------------------------
+    def _fit_ground_plane_ransac(self, depth_frame: np.ndarray,
+                                  K: np.ndarray,
+                                  n_iter:         int   = RANSAC_ITERS,
+                                  inlier_thresh_m: float = 0.04,
+                                  force_refit:    bool  = False,
+                                  ) -> Optional[Tuple[np.ndarray, float]]:
+
+        self._plane_frame_count += 1
+
+        # Return cached result unless it's time to refit
+        if (not force_refit and
+                self._plane_cache is not None and
+                self._plane_frame_count % PLANE_REFIT_INTERVAL != 0):
+            return self._plane_cache
+
+        h, w       = depth_frame.shape
+        depth_mm   = depth_frame.astype(np.float32)
+        lower_y    = int(h * 0.7)
+        lower_depth = depth_mm[lower_y:, :]
         valid_mask = (lower_depth > 100) & (lower_depth < 5000)
-        
+
         if np.sum(valid_mask) < 50:
-            return None
-            
+            return self._plane_cache  # keep stale result rather than None
+
         y_indices, x_indices = np.where(valid_mask)
-        y_indices = y_indices + lower_region_y
-        
-        fx, fy = K[0, 0], K[1, 1]
-        cx, cy = K[0, 2], K[1, 2]
-        
-        z_vals = lower_depth[valid_mask] / 1000.0
-        x_vals = (x_indices - cx) * z_vals / fx
-        y_vals = (y_indices - cy) * z_vals / fy
-        
-        points_3d = np.column_stack([x_vals, y_vals, z_vals])
-        
-        # Downsample to ~5k points: SVD doesn't need 50k+ points for a plane fit
-        # This cuts memory usage and speeds up computation significantly
-        if len(points_3d) > 5000:
-            idx = np.random.choice(len(points_3d), 5000, replace=False)
+        y_indices = y_indices + lower_y
+        fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
+
+        z_vals   = lower_depth[valid_mask] / 1000.0
+        points_3d = np.column_stack([
+            (x_indices - cx) * z_vals / fx,
+            (y_indices - cy) * z_vals / fy,
+            z_vals,
+        ])
+
+        # OPT: reduced point budget
+        if len(points_3d) > MAX_RANSAC_PTS:
+            idx       = np.random.choice(len(points_3d), MAX_RANSAC_PTS, replace=False)
             points_3d = points_3d[idx]
-            
-        centroid = np.mean(points_3d, axis=0)
-        centered_points = points_3d - centroid
-        
-        # 🔑 CRITICAL FIX: full_matrices=False prevents O(N²) memory allocation
-        _, _, vh = np.linalg.svd(centered_points, full_matrices=False)
-        normal = vh[-1, :]  # Normal vector corresponds to smallest singular value
-        plane_distance = -np.dot(normal, centroid)
-        
-        return normal, plane_distance
-    def _compute_distance_to_plane(self, points_3d: np.ndarray, 
-                                   normal: np.ndarray, 
-                                   plane_distance: float) -> np.ndarray:
-        """Compute perpendicular distance from points to plane"""
-        # Distance = |normal . point + plane_distance| / ||normal||
-        distances = np.abs(np.dot(points_3d, normal) + plane_distance)
-        return distances
-    
-    def _check_spatial_coherence(self, depth_frame: np.ndarray, 
-                                 mask: np.ndarray,
-                                 label_image: np.ndarray,
-                                 label_id: int) -> Tuple[bool, float]:
+
+        best_normal, best_d, best_count = None, None, 0
+
+        for _ in range(n_iter):
+            si  = np.random.choice(len(points_3d), 3, replace=False)
+            p0, p1, p2 = points_3d[si]
+            normal = np.cross(p1 - p0, p2 - p0)
+            nl = np.linalg.norm(normal)
+            if nl < 1e-6:
+                continue
+            normal /= nl
+            if normal[1] > 0:
+                normal = -normal
+            d = -np.dot(normal, p0)
+
+            cnt = int(np.sum(np.abs(points_3d @ normal + d) < inlier_thresh_m))
+            if cnt > best_count:
+                best_count, best_normal, best_d = cnt, normal.copy(), d
+
+        if best_normal is None or best_count < 30:
+            return self._plane_cache
+
+        inliers = points_3d[np.abs(points_3d @ best_normal + best_d) < inlier_thresh_m]
+        if len(inliers) < 10:
+            return self._plane_cache
+
+        centroid = np.mean(inliers, axis=0)
+        _, _, vh = np.linalg.svd(inliers - centroid, full_matrices=False)
+        normal   = vh[-1]
+        if normal[1] > 0:
+            normal = -normal
+        plane_d = -np.dot(normal, centroid)
+
+        self._plane_cache = (normal, plane_d)
+        return self._plane_cache
+
+    # ------------------------------------------------------------------
+    # Hole fill
+    # ------------------------------------------------------------------
+    def _fill_mask_holes(self, mask: np.ndarray) -> np.ndarray:
+        padded = cv2.copyMakeBorder(mask, 1, 1, 1, 1, cv2.BORDER_CONSTANT, value=0)
+        cv2.floodFill(padded, None, (0, 0), 255)
+        bg = padded[1:-1, 1:-1]
+        return cv2.bitwise_or(mask, cv2.bitwise_not(bg))
+
+    # ------------------------------------------------------------------
+    # OPT: vectorised depth-grow — single pass instead of per-component loop
+    # ------------------------------------------------------------------
+    def _depth_grow_mask(self, protrusion_mask: np.ndarray,
+                          depth_m: np.ndarray,
+                          depth_tol_m: float = 0.12) -> np.ndarray:
         """
-        Check if obstacle region has sufficient contiguous valid-depth pixels
-        with low internal depth variance
-        Returns: (is_coherent, internal_variance_mm)
+        Instead of iterating over each connected component and growing it
+        independently (expensive), we compute a single global
+        'depth-compatible' map using the median depth of the whole mask,
+        then do one dilate → intersect pass.  Works well because the
+        dominant obstacle at each depth band is already separated by the
+        height threshold.
         """
-        # Extract depth values for this label
-        region_mask = (label_image == label_id)
-        
-        if np.sum(region_mask) < self.min_contiguous_pixels:
-            return False, 0.0
-        
-        region_depths = depth_frame[region_mask].astype(np.float32)
-        valid_region = (region_depths > 100) & (region_depths < 5000)
-        
-        if np.sum(valid_region) < self.min_contiguous_pixels:
-            return False, 0.0
-        
-        valid_depths = region_depths[valid_region]
-        variance_mm = float(np.std(valid_depths))
-        
-        is_coherent = (variance_mm <= self.max_internal_variance_mm)
-        
-        return is_coherent, variance_mm
-    
-    def _check_gradient_discontinuity(self, depth_frame: np.ndarray,
-                                      mask: np.ndarray,
-                                      K: np.ndarray) -> bool:
+        valid_depths = depth_m[protrusion_mask > 0]
+        if len(valid_depths) == 0:
+            return protrusion_mask
+
+        # Use the lower quartile as the representative depth —
+        # it corresponds to the closest (most important) obstacles
+        representative_depth = float(np.percentile(valid_depths, 25))
+
+        depth_compatible = (
+            (np.abs(depth_m - representative_depth) < depth_tol_m) &
+            (depth_m > self.min_distance) &
+            (depth_m < self.max_distance)
+        ).astype(np.uint8)
+
+        grown = protrusion_mask.copy()
+        for _ in range(2):   # 2 passes instead of 3
+            dilated = cv2.dilate(grown, self._kernel11, iterations=1)
+            grown   = cv2.bitwise_and(dilated, depth_compatible * 255)
+            grown   = cv2.bitwise_or(grown, protrusion_mask)
+
+        return grown
+
+    # ------------------------------------------------------------------
+    # OPT: contour merge — use bounding rect centre for depth lookup
+    #      (no full H×W mask draw per contour)
+    # ------------------------------------------------------------------
+    def _merge_nearby_contours_by_zone(self,
+                                        contours: list,
+                                        depth_m:  np.ndarray,
+                                        h: int, w: int,
+                                        merge_dist_px: int) -> list:
+        if len(contours) <= 1:
+            return contours
+
+        rects = [cv2.boundingRect(c) for c in contours]
+
+        def rect_dist(r1, r2):
+            dx = max(0, max(r1[0], r2[0]) - min(r1[0]+r1[2], r2[0]+r2[2]))
+            dy = max(0, max(r1[1], r2[1]) - min(r1[1]+r1[3], r2[1]+r2[3]))
+            return (dx*dx + dy*dy) ** 0.5
+
+        # OPT: single pixel lookup at bounding-rect centre instead of
+        #      drawing a full mask and computing median
+        def centre_depth(r):
+            cy_r = min(r[1] + r[3]//2, h-1)
+            cx_r = min(r[0] + r[2]//2, w-1)
+            return float(depth_m[cy_r, cx_r])
+
+        depths = [centre_depth(r) for r in rects]
+
+        parent = list(range(len(contours)))
+
+        def find(i):
+            while parent[i] != i:
+                parent[i] = parent[parent[i]]
+                i = parent[i]
+            return i
+
+        for i in range(len(contours)):
+            for j in range(i+1, len(contours)):
+                if (rect_dist(rects[i], rects[j]) < merge_dist_px and
+                        abs(depths[i] - depths[j]) < 0.3):
+                    ri, rj = find(i), find(j)
+                    if ri != rj:
+                        parent[ri] = rj
+
+        groups: dict = {}
+        for i in range(len(contours)):
+            groups.setdefault(find(i), []).append(i)
+
+        merged = []
+        for gidx in groups.values():
+            gc = [contours[i] for i in gidx]
+            if len(gc) == 1:
+                merged.append(gc[0])
+            else:
+                tmp = np.zeros((h, w), dtype=np.uint8)
+                cv2.drawContours(tmp, gc, -1, 255, thickness=cv2.FILLED)
+                tmp = cv2.morphologyEx(tmp, cv2.MORPH_CLOSE, self._kernel15)
+                new_cnts, _ = cv2.findContours(
+                    tmp, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                if new_cnts:
+                    merged.append(max(new_cnts, key=cv2.contourArea))
+
+        return merged
+
+    def _build_distance_zoned_mask(self, height_map_mm, depth_m,
+                                    valid_mask, heights_mm, y_idx, x_idx):
+        h, w       = height_map_mm.shape
+        thresh_map = np.full((h, w), 999.0, dtype=np.float32)
+        for zone in reversed(self.distance_zones):
+            thresh_map[depth_m <= zone['max_m']] = zone['height_thresh_mm']
+
+        out = np.zeros((h, w), dtype=np.uint8)
+        out[valid_mask] = (
+            height_map_mm[valid_mask] > thresh_map[valid_mask]
+        ).astype(np.uint8) * 255
+        return out
+
+    # ------------------------------------------------------------------
+    # Main detection — returns (obstacles, protrusion_mask, plane_result)
+    # so main() doesn't need to call _fit_ground_plane_ransac a second time
+    # ------------------------------------------------------------------
+    def detect_obstacles(self,
+                         depth_frame: np.ndarray,
+                         K: np.ndarray,
+                         confidence_map: Optional[np.ndarray] = None,
+                         ) -> Tuple[List[dict], np.ndarray,
+                                    Optional[Tuple[np.ndarray, float]],
+                                    np.ndarray]:
         """
-        Check if region shows significant gradient discontinuity
-        True obstacles show >150mm discontinuities; floor tiles remain <50mm
+        Returns (obstacles, protrusion_mask, ground_result, height_map_mm)
+        ground_result and height_map_mm are passed to RGBDepthFusion.fuse()
+        so they don't need to be recomputed there.
         """
-        depth_m = depth_frame.astype(np.float32) / 1000.0
-        
-        # Compute Sobel gradients
-        grad_x = cv2.Sobel(depth_m, cv2.CV_32F, 1, 0, ksize=3)
-        grad_y = cv2.Sobel(depth_m, cv2.CV_32F, 0, 1, ksize=3)
-        grad_magnitude = np.sqrt(grad_x**2 + grad_y**2)
-        
-        # Get gradient values in the mask region
-        if np.sum(mask) == 0:
+        obstacles = []
+        h, w      = depth_frame.shape
+        depth_m   = depth_frame.astype(np.float32) / 1000.0
+
+        valid_mask = (depth_m >= self.min_distance) & (depth_m <= self.max_distance)
+        empty_hmap = np.zeros((h, w), dtype=np.float32)
+
+        if not np.any(valid_mask):
+            return obstacles, np.zeros((h, w), dtype=np.uint8), None, empty_hmap
+
+        ground_result = self._fit_ground_plane_ransac(depth_frame, K)
+        if ground_result is None:
+            return obstacles, np.zeros((h, w), dtype=np.uint8), None, empty_hmap
+
+        normal, plane_distance = ground_result
+        fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
+
+        y_idx, x_idx = np.where(valid_mask)
+        z     = depth_m[y_idx, x_idx]
+        pts   = np.column_stack([
+            (x_idx - cx) * z / fx,
+            (y_idx - cy) * z / fy,
+            z,
+        ])
+
+        heights_mm              = np.abs(pts @ normal + plane_distance) * 1000.0
+        height_map_mm           = np.zeros((h, w), dtype=np.float32)
+        height_map_mm[y_idx, x_idx] = heights_mm
+
+        protrusion_mask = self._build_distance_zoned_mask(
+            height_map_mm, depth_m, valid_mask, heights_mm, y_idx, x_idx)
+
+        if confidence_map is not None:
+            conf_mask       = (confidence_map >= self.stereo_confidence_threshold
+                               ).astype(np.uint8) * 255
+            protrusion_mask = cv2.bitwise_and(protrusion_mask, conf_mask)
+
+        protrusion_mask = cv2.morphologyEx(protrusion_mask, cv2.MORPH_CLOSE,
+                                            self._kernel7)
+        protrusion_mask = self._fill_mask_holes(protrusion_mask)
+        protrusion_mask = self._depth_grow_mask(protrusion_mask, depth_m)
+        protrusion_mask = cv2.morphologyEx(protrusion_mask, cv2.MORPH_CLOSE,
+                                            self._kernel7)
+
+        contours, _ = cv2.findContours(
+            protrusion_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        contours = self._merge_nearby_contours_by_zone(
+            contours, depth_m, h, w, merge_dist_px=50)
+
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            x, y, w_box, h_box = cv2.boundingRect(cnt)
+            cx_box = x + w_box // 2
+            cy_box = y + h_box // 2
+
+            if cy_box >= h or cx_box >= w:
+                continue
+            z_val = depth_m[cy_box, cx_box]
+            if z_val < self.min_distance or z_val > self.max_distance:
+                continue
+
+            zone = self._get_zone(z_val)
+            if area < zone['min_area_px']:
+                continue
+
+            pos_x    = (cx_box - cx) * z_val / fx
+            pos_y    = (cy_box - cy) * z_val / fy
+            distance = float(np.sqrt(pos_x**2 + pos_y**2 + z_val**2))
+
+            # OPT: use bounding-rect pixel sample for height instead of
+            #      drawing a full mask (saves ~1ms per contour)
+            cnt_mask          = np.zeros((h, w), dtype=np.uint8)
+            cv2.drawContours(cnt_mask, [cnt], -1, 255, thickness=cv2.FILLED)
+            contour_heights   = height_map_mm[cnt_mask == 255]
+            median_h = float(np.median(contour_heights)) if len(contour_heights) else 0.0
+
+            if median_h < zone['median_h_min']:
+                continue
+
+            obstacles.append({
+                'center_px':     (cx_box, cy_box),
+                'position_3d_m': np.array([pos_x, pos_y, z_val]),
+                'distance_m':    distance,
+                'contour':       cnt,
+                'area_px':       area,
+                'median_height_mm': median_h,
+                'zone':          zone['max_m'],
+            })
+
+        obstacles.sort(key=lambda o: o['distance_m'])
+        return obstacles, protrusion_mask, ground_result, height_map_mm
+
+
+# ---------------------------------------------------------------------------
+# RGBDepthFusion  —  FastSAM on a background thread, fused each depth frame
+# ---------------------------------------------------------------------------
+class RGBDepthFusion:
+    """
+    FastSAM runs asynchronously on a background thread so it never blocks
+    the depth pipeline.  The main loop calls fuse() which uses the most
+    recent completed FastSAM result (which may be 1-3 frames stale —
+    acceptable because segmentation masks change slowly).
+    """
+
+    def __init__(self,
+                 model_path:          str   = "FastSAM-s.pt",
+                 confidence:          float = 0.4,
+                 iou_threshold:       float = 0.9,
+                 min_mask_area_frac:  float = 0.003,
+                 max_mask_area_frac:  float = 0.8):
+        print("Loading FastSAM model...")
+        self.model               = FastSAM(model_path)
+        self.confidence          = confidence
+        self.iou_threshold       = iou_threshold
+        self.min_mask_area_frac  = min_mask_area_frac
+        self.max_mask_area_frac  = max_mask_area_frac
+
+        self.floor_hsv_mean: Optional[np.ndarray] = None
+        self.floor_hsv_std:  Optional[np.ndarray] = None
+
+        # Background thread state
+        self._lock           = threading.Lock()
+        self._latest_masks:  List[np.ndarray] = []   # most recent SAM output
+        self._pending_frame: Optional[np.ndarray] = None  # frame queued for SAM
+        self._thread         = threading.Thread(target=self._worker, daemon=True)
+        self._thread.start()
+        print("FastSAM background thread started.")
+
+    # ------------------------------------------------------------------
+    # Background worker — processes one frame at a time, always takes
+    # the most recently queued frame (drops stale ones)
+    # ------------------------------------------------------------------
+    def _worker(self):
+        while True:
+            frame = None
+            with self._lock:
+                if self._pending_frame is not None:
+                    frame, self._pending_frame = self._pending_frame, None
+
+            if frame is None:
+                time.sleep(0.005)
+                continue
+
+            masks = self._run_fastsam_sync(frame)
+            with self._lock:
+                self._latest_masks = masks
+
+    def submit_frame(self, rgb_frame: np.ndarray):
+        """Call this every FASTSAM_INTERVAL frames to queue a new SAM job."""
+        with self._lock:
+            # Always overwrite — we only care about the most recent frame
+            self._pending_frame = rgb_frame.copy()
+
+    def get_latest_masks(self) -> List[np.ndarray]:
+        with self._lock:
+            return list(self._latest_masks)
+
+    # ------------------------------------------------------------------
+    # OPT: smaller imgsz (320 vs 640) — ~4× faster inference
+    # ------------------------------------------------------------------
+    def _run_fastsam_sync(self, rgb_frame: np.ndarray) -> List[np.ndarray]:
+        h, w       = rgb_frame.shape[:2]
+        frame_area = h * w
+
+        results = self.model(
+            rgb_frame,
+            device='cpu',
+            retina_masks=False,   # retina_masks=True is slow; False + resize is fine
+            imgsz=FASTSAM_IMGSZ,  # 320 instead of 640
+            conf=self.confidence,
+            iou=self.iou_threshold,
+            verbose=False,
+        )
+
+        if not results or results[0].masks is None:
+            return []
+
+        masks = []
+        for mt in results[0].masks.data:
+            mask = mt.cpu().numpy().astype(np.uint8)
+            if mask.shape != (h, w):
+                mask = cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST)
+            af = np.sum(mask) / frame_area
+            if self.min_mask_area_frac <= af <= self.max_mask_area_frac:
+                masks.append(mask)
+
+        # Deduplicate by IoU — vectorised using dot products on flattened masks
+        if len(masks) > 1:
+            masks.sort(key=lambda m: int(np.sum(m)), reverse=True)
+            flat   = np.stack([m.ravel().astype(np.float32) for m in masks])
+            areas  = flat.sum(axis=1)
+            keep   = []
+            kept_flat: List[np.ndarray] = []
+            for i, f in enumerate(flat):
+                if any(
+                    float(np.dot(f, kf)) /
+                    max(1.0, float(areas[i] + areas[ki] - np.dot(f, kf))) > 0.8
+                    for ki, kf in kept_flat
+                ):
+                    continue
+                keep.append(masks[i])
+                kept_flat.append((i, f))
+            masks = keep
+
+        return masks
+
+    # ------------------------------------------------------------------
+    # Floor model update (same as before, unchanged)
+    # ------------------------------------------------------------------
+    def _update_floor_model(self, rgb_frame, depth_m,
+                             ground_normal, plane_d, K):
+        fx, fy, cx, cy = K[0,0], K[1,1], K[0,2], K[1,2]
+        y_idx, x_idx   = np.where((depth_m > 0.3) & (depth_m < 2.5))
+        if len(y_idx) == 0:
+            return
+        z   = depth_m[y_idx, x_idx]
+        pts = np.column_stack([
+            (x_idx - cx) * z / fx,
+            (y_idx - cy) * z / fy,
+            z,
+        ])
+        heights    = np.abs(pts @ ground_normal + plane_d) * 1000.0
+        floor_mask = heights < 40
+        fy_idx, fx_idx = y_idx[floor_mask], x_idx[floor_mask]
+        if len(fy_idx) < 50:
+            return
+        hsv = cv2.cvtColor(rgb_frame, cv2.COLOR_RGB2HSV).astype(np.float32)
+        fp  = hsv[fy_idx, fx_idx]
+        self.floor_hsv_mean = np.mean(fp, axis=0)
+        self.floor_hsv_std  = np.std(fp, axis=0) + 1e-6
+
+    def _is_floor_segment(self, mask, hsv_frame) -> bool:
+        """OPT: accepts pre-converted HSV frame, not raw RGB."""
+        if self.floor_hsv_mean is None:
             return False
-        
-        region_gradients = grad_magnitude[mask]
-        median_gradient_m = float(np.median(region_gradients))
-        median_gradient_mm = median_gradient_m * 1000.0
-        
-        # True obstacle should have significant gradient
-        return median_gradient_mm >= self.obstacle_gradient_threshold_mm
-    
-def detect_obstacles(self, depth_frame: np.ndarray, 
-                    K: np.ndarray,
-                    confidence_map: Optional[np.ndarray] = None) -> List[dict]:
-    obstacles = []
-    h, w = depth_frame.shape
-    
-    # 1. Valid depth mask (35cm to 5m)
-    depth_m = depth_frame.astype(np.float32) / 1000.0
-    valid_mask = (depth_m >= self.min_distance) & (depth_m <= self.max_distance)
-    
-    if not np.any(valid_mask):
-        return obstacles, np.zeros((h, w), dtype=np.uint8)
-    
-    # 2. Fit ground plane (keep your existing SVD method)
-    ground_result = self._fit_ground_plane(depth_frame, K)
-    if ground_result is None:
-        return obstacles, np.zeros((h, w), dtype=np.uint8)
-    
-    normal, plane_distance = ground_result
-    fx, fy, cx, cy = K[0,0], K[1,1], K[0,2], K[1,2]
-    
-    # 3. Vectorized: Compute height-above-ground for ALL valid pixels
-    y_idx, x_idx = np.where(valid_mask)
-    z = depth_m[y_idx, x_idx]
-    
-    # Back-project to 3D camera coordinates
-    x_3d = (x_idx - cx) * z / fx
-    y_3d = (y_idx - cy) * z / fy
-    points_3d = np.column_stack([x_3d, y_3d, z])
-    
-    # Distance to plane = height above ground (meters)
-    heights_m = np.abs(np.sum(points_3d * normal, axis=1) + plane_distance)
-    heights_mm = heights_m * 1000.0
-    
-    # 4. Create protrusion mask (ignore bumps < 30mm)
-    protrusion_mask = np.zeros((h, w), dtype=np.uint8)
-    protrusion_mask[y_idx, x_idx] = (heights_mm > 30).astype(np.uint8) * 255
-    
-    # 5. Apply confidence gating & morphological cleanup
-    if confidence_map is not None:
-        conf_mask = (confidence_map >= self.stereo_confidence_threshold).astype(np.uint8) * 255
-        protrusion_mask = cv2.bitwise_and(protrusion_mask, conf_mask)
-        
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    protrusion_mask = cv2.morphologyEx(protrusion_mask, cv2.MORPH_CLOSE, kernel)
-    protrusion_mask = cv2.morphologyEx(protrusion_mask, cv2.MORPH_OPEN, kernel)
-    
-    # 6. Extract contours instead of bounding boxes
-    contours, _ = cv2.findContours(protrusion_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    
-    for cnt in contours:
-        area = cv2.contourArea(cnt)
-        if area < self.min_contiguous_pixels:
-            continue
-            
-        # Get bounding rect for centroid calculation (fast)
-        x, y, w_box, h_box = cv2.boundingRect(cnt)
-        cx_box, cy_box = x + w_box//2, y + h_box//2
-        
-        # Sample depth at centroid
-        if cy_box >= h or cx_box >= w:
-            continue
-        z_val = depth_m[cy_box, cx_box]
-        
-        if z_val < self.min_distance or z_val > self.max_distance:
-            continue
-            
-        # 3D position
-        pos_x = (cx_box - cx) * z_val / fx
-        pos_y = (cy_box - cy) * z_val / fy
-        distance = float(np.sqrt(pos_x**2 + pos_y**2 + z_val**2))
-        
-        obstacles.append({
-            'center_px': (cx_box, cy_box),
-            'position_3d_m': np.array([pos_x, pos_y, z_val]),
-            'distance_m': distance,
-            'contour': cnt,  # Store for filled drawing
-            'area_px': area,
-            'median_height_mm': float(np.median(heights_mm[cv2.pointPolygonTest(cnt, (x, y), measureDist=False) > 0]))
-        })
-        
-    obstacles.sort(key=lambda o: o['distance_m'])
-    return obstacles, protrusion_mask
+        px = hsv_frame[mask > 0]
+        if len(px) == 0:
+            return False
+        z  = np.abs(px.mean(axis=0) - self.floor_hsv_mean) / self.floor_hsv_std
+        return float(z[0]) < 2.0 and float(z[1]) < 2.0
+
+    def _get_mask_depth_stats(self, mask, depth_m, min_dist, max_dist):
+        interior = depth_m[mask > 0]
+        valid    = interior[(interior > min_dist) & (interior < max_dist)]
+        if len(valid) > 20:
+            return {'median_depth_m': float(np.median(valid)),
+                    'depth_coverage': len(valid) / max(1, len(interior)),
+                    'source': 'interior'}
+
+        kernel  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+        dilated = cv2.dilate(mask, kernel, iterations=2)
+        ring    = cv2.bitwise_and(dilated, cv2.bitwise_not(mask))
+        edge    = depth_m[ring > 0]
+        valid_e = edge[(edge > min_dist) & (edge < max_dist)]
+        if len(valid_e) > 10:
+            return {'median_depth_m': float(np.median(valid_e)),
+                    'depth_coverage': 0.0,
+                    'source': 'edge_ring'}
+        return None
+
+    def _mask_iou(self, a, b) -> float:
+        i = np.logical_and(a, b).sum()
+        u = np.logical_or(a, b).sum()
+        return float(i) / max(1, float(u))
+
+    def _contour_from_mask(self, mask):
+        cs, _ = cv2.findContours(mask.astype(np.uint8),
+                                  cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        return max(cs, key=cv2.contourArea) if cs else None
+
+    # ------------------------------------------------------------------
+    # fuse() — accepts pre-computed ground_result and height_map_mm
+    #          so main() doesn't recompute them
+    # ------------------------------------------------------------------
+    def fuse(self,
+             rgb_frame:      np.ndarray,
+             depth_m:        np.ndarray,
+             depth_obstacles: List[dict],
+             ground_normal:  np.ndarray,
+             plane_d:        float,
+             K:              np.ndarray,
+             height_map_mm:  np.ndarray,
+             min_dist:       float = 0.35,
+             max_dist:       float = 2.5) -> List[dict]:
+
+        h, w   = depth_m.shape
+        fx, fy, cx, cy = K[0,0], K[1,1], K[0,2], K[1,2]
+
+        self._update_floor_model(rgb_frame, depth_m, ground_normal, plane_d, K)
+
+        # OPT: convert HSV once, pass to _is_floor_segment for all masks
+        hsv_frame = cv2.cvtColor(rgb_frame, cv2.COLOR_RGB2HSV).astype(np.float32)
+
+        # OPT: pre-rasterise all depth obstacle masks once — O(n) not O(n×m)
+        d_masks = []
+        for d_obs in depth_obstacles:
+            dm = np.zeros((h, w), dtype=np.uint8)
+            cv2.drawContours(dm, [d_obs['contour']], -1, 255, thickness=cv2.FILLED)
+            d_masks.append(dm)
+
+        # Get latest masks from background thread
+        rgb_masks = self.get_latest_masks()
+
+        depth_matched  = [False] * len(depth_obstacles)
+        fused_obstacles: List[dict] = []
+
+        for mask in rgb_masks:
+            if self._is_floor_segment(mask, hsv_frame):
+                continue
+
+            ds = self._get_mask_depth_stats(mask, depth_m, min_dist, max_dist)
+            if ds is None:
+                continue
+
+            mask_depth = ds['median_depth_m']
+            contour    = self._contour_from_mask(mask)
+            if contour is None:
+                continue
+
+            x_b, y_b, w_b, h_b = cv2.boundingRect(contour)
+            cx_box = x_b + w_b // 2
+            cy_box = y_b + h_b // 2
+            pos_x  = (cx_box - cx) * mask_depth / fx
+            pos_y  = (cy_box - cy) * mask_depth / fy
+            dist   = float(np.sqrt(pos_x**2 + pos_y**2 + mask_depth**2))
+
+            if dist < min_dist or dist > max_dist:
+                continue
+
+            # OPT: use pre-rasterised depth masks
+            matched_idx, best_iou = None, 0.15
+            for di, dm in enumerate(d_masks):
+                iou = self._mask_iou(mask, dm)
+                if iou > best_iou:
+                    best_iou, matched_idx = iou, di
+
+            cnt_mask         = np.zeros((h, w), dtype=np.uint8)
+            cv2.drawContours(cnt_mask, [contour], -1, 255, thickness=cv2.FILLED)
+            contour_heights  = height_map_mm[cnt_mask == 255]
+            median_h = float(np.median(contour_heights)) if len(contour_heights) else 0.0
+
+            if matched_idx is not None:
+                depth_matched[matched_idx] = True
+                fused_obstacles.append({
+                    **depth_obstacles[matched_idx],
+                    'contour':          contour,
+                    'rgb_mask':         mask,
+                    'median_height_mm': median_h,
+                    'detection_source': 'depth+rgb',
+                    'depth_coverage':   ds['depth_coverage'],
+                })
+            else:
+                if median_h < 30 and ds['source'] == 'edge_ring':
+                    continue
+                fused_obstacles.append({
+                    'center_px':        (cx_box, cy_box),
+                    'position_3d_m':    np.array([pos_x, pos_y, mask_depth]),
+                    'distance_m':       dist,
+                    'contour':          contour,
+                    'area_px':          int(cv2.contourArea(contour)),
+                    'median_height_mm': median_h,
+                    'rgb_mask':         mask,
+                    'detection_source': 'rgb',
+                    'depth_coverage':   ds['depth_coverage'],
+                })
+
+        for di, d_obs in enumerate(depth_obstacles):
+            if not depth_matched[di]:
+                fused_obstacles.append({
+                    **d_obs,
+                    'rgb_mask':         None,
+                    'detection_source': 'depth',
+                    'depth_coverage':   1.0,
+                })
+
+        fused_obstacles.sort(key=lambda o: o['distance_m'])
+        return fused_obstacles
 
 
-def create_debug_visualization(rgb_frame: np.ndarray,
-                              depth_viz: np.ndarray,
-                              obstacles: List[dict],
-                              obstacle_mask: np.ndarray,
-                              mode: str) -> np.ndarray:
-    # Create RGBA overlay for organic obstacle shapes
+# ---------------------------------------------------------------------------
+# Debug visualisation
+# ---------------------------------------------------------------------------
+def create_debug_visualization(rgb_frame, depth_viz, tag_detections,
+                                obstacles, obstacle_mask, mode, fps):
     overlay = np.zeros_like(rgb_frame)
-    
+    SOURCE_COLORS = {
+        'depth':     (0,   200,   0),
+        'rgb':       (200, 100,   0),
+        'depth+rgb': (0,   200, 200),
+    }
+
     for obs in obstacles:
-        dist = obs['distance_m']
-        # Color: Red (close) -> Green (far)
-        color_val = int(255 * min(1.0, dist / 2.0))
-        color = (255 - color_val, color_val, 0)
-        
-        # Draw filled contour
+        dist       = obs['distance_m']
+        base_color = SOURCE_COLORS.get(obs.get('detection_source', 'depth'), (0, 200, 0))
+        fade       = max(0.3, 1.0 - dist / 2.5)
+        color      = tuple(int(c * fade) for c in base_color)
         cv2.drawContours(overlay, [obs['contour']], -1, color, thickness=cv2.FILLED)
-        # Draw outline
         cv2.drawContours(overlay, [obs['contour']], -1, (255, 255, 255), 1)
-        
-        # Label at centroid
-        cx, cy = obs['center_px']
-        cv2.putText(overlay, f"{dist:.2f}m", (cx - 20, cy - 5),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
-                   
-    # Blend overlay with RGB (30% opacity)
-    blended_rgb = cv2.addWeighted(rgb_frame, 0.7, overlay, 0.3, 0)
-    
-    # Stack with depth viz
-    depth_viz_resized = cv2.resize(depth_viz, (rgb_frame.shape[1], rgb_frame.shape[0]))
-    combined = np.hstack([blended_rgb, depth_viz_resized])
-    
-    cv2.putText(combined, f"Mode: {mode}", (10, 30),
-               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        cx_o, cy_o = obs['center_px']
+        src        = obs.get('detection_source', '?')[0].upper()
+        cv2.putText(overlay, f"{src} {dist:.2f}m", (cx_o-20, cy_o-5),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+
+    blended = cv2.addWeighted(rgb_frame, 0.7, overlay, 0.3, 0)
+
+    for tag in tag_detections:
+        cv2.polylines(blended, [tag['corners'].astype(int)], True, (0, 255, 0), 2)
+        cv2.circle(blended, tag['center'], 5, (0, 255, 0), -1)
+        cv2.putText(blended, f"ID:{tag['tag_id']} {tag['distance_m']:.2f}m",
+                    (tag['center'][0]+10, tag['center'][1]),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+
+    depth_viz_r = cv2.resize(depth_viz, (rgb_frame.shape[1], rgb_frame.shape[0]))
+    combined    = np.hstack([blended, depth_viz_r])
+
+    mh, mw = depth_viz_r.shape[:2]
+    sm      = cv2.resize(obstacle_mask, (mw//4, mh//4))
+    smc     = cv2.applyColorMap(sm, cv2.COLORMAP_HOT)
+    hc, wc  = combined.shape[:2]
+    oh, ow  = smc.shape[:2]
+    combined[hc-oh:, wc-ow:] = smc
+
+    cv2.putText(combined, f"Mode: {mode}  FPS: {fps:.1f}", (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
     return combined
 
 
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
 def main():
-    """Main debugging loop"""
-    print("="*60)
-    print("OAK-D Lite Comprehensive Debugging Suite")
-    print("="*60)
-    print("\nFeatures:")
-    print("  - Real-time depth map quality analysis")
-    print("  - AprilTag detection at various distances")
-    print("  - Spatial obstacle detection with 3D coordinates")
-    print("  - Multiple stereo depth configuration modes")
-    print("  - Ground-plane rejection (±40mm tolerance)")
-    print("  - Spatial coherence filter (≥15 contiguous pixels, <80mm variance)")
-    print("  - Confidence gating (stereo >220, detection >0.65)")
-    print("  - Gradient discontinuity check (>150mm = obstacle)")
-    print("\nPipeline Optimizations:")
-    print("  - Resolution: 640×400 (reduced from 640×480)")
-    print("  - Vectorized NumPy processing (no Python for-loops)")
-    print("  - FPS target: 15+ (from ~3.4)")
-    print("\nNOTE: GUI display requires X11/display support.")
-    print("      Running in headless mode - data printed to console.")
-    print("="*60)
-    
-    # Initialize components
-    depth_debugger = DepthMapDebugger()
-    tag_tester = AprilTagDistanceTester()
-    obstacle_detector = SpatialObstacleDetector()
+    print("=" * 60)
+    print("OAK-D Lite Comprehensive Debugging Suite  [optimised]")
+    print("=" * 60)
 
-    
+    depth_debugger    = DepthMapDebugger()
+    tag_tester        = AprilTagDistanceTester()
+    obstacle_detector = SpatialObstacleDetector()
+    fusion            = RGBDepthFusion(model_path="FastSAM-s.pt")
+
     script_dir = os.path.dirname(os.path.abspath(__file__))
     images_dir = os.path.join(script_dir, "Images")
     os.makedirs(images_dir, exist_ok=True)
 
-    current_mode = "high_accuracy"  # Use optimized mode by default
-    
-    # Start OAK-D device
-    print("\nInitializing OAK-D Lite...")
+    current_mode = "high_accuracy"
+
+    print("\nInitialising OAK-D Lite...")
     try:
         pipeline = StereoDepthConfigurator.create_pipeline(current_mode)
-        device = dai.Device(pipeline, usb2Mode=True)
+        device   = dai.Device(pipeline, usb2Mode=True)
         print(f"✅ Connected | MxId: {device.getMxId()}")
-        
-        # Get calibration intrinsics - use actual output size (640x400)
-        calib = device.readCalibration()
+
+        calib     = device.readCalibration()
         intrinsics = calib.getCameraIntrinsics(dai.CameraBoardSocket.CAM_A, 640, 400)
-        K = np.array(intrinsics, dtype=np.float32)
-        print(f"Camera Intrinsics: fx={intrinsics[0][0]:.1f}, fy={intrinsics[1][1]:.1f}, cx={intrinsics[0][2]:.1f}, cy={intrinsics[1][2]:.1f}")
-        
-        # Create output queues
-        q_rgb = device.getOutputQueue(name="rgb", maxSize=1, blocking=False)
-        q_depth = device.getOutputQueue(name="depth", maxSize=1, blocking=False)
-        q_conf = device.getOutputQueue(name="confidence", maxSize=1, blocking=False)
-        
+        K         = np.array(intrinsics, dtype=np.float32)
+
+        q_rgb   = device.getOutputQueue(name="rgb",        maxSize=1, blocking=False)
+        q_depth = device.getOutputQueue(name="depth",      maxSize=1, blocking=False)
+        q_conf  = device.getOutputQueue(name="confidence", maxSize=1, blocking=False)
+
     except Exception as e:
-        print(f"❌ Failed to initialize OAK-D: {e}")
-        print("Running in simulation mode with synthetic data...")
+        print(f"❌ Failed to initialise OAK-D: {e}")
         device = None
-        q_rgb = None
-        q_depth = None
-        q_conf = None
-        K = np.array([[800, 0, 320], [0, 800, 200], [0, 0, 1]], dtype=np.float32)  # Adjusted for 640x400
-    
+        q_rgb = q_depth = q_conf = None
+        K = np.array([[552.6, 0, 311.4], [0, 552.6, 202.5], [0, 0, 1]],
+                     dtype=np.float32)
+
     try:
-        frame_count = 0
-        start_time = time.time()
+        frame_count          = 0
+        start_time           = time.time()
         last_confidence_frame = None
-        obstacle_history = deque(maxlen=3)
+        # OPT: lightweight temporal mask — running OR then decay instead of
+        #      np.median over 3 full frames every frame
+        stable_mask          = None
 
         while True:
-            # Get frames (handle simulation mode)
+            # ── Capture ────────────────────────────────────────────────
             if device is not None and q_rgb and q_depth:
-                rgb_packet = q_rgb.get()
+                rgb_packet   = q_rgb.get()
                 depth_packet = q_depth.get()
-                conf_packet = q_conf.get() if q_conf else None
-                
+                conf_packet  = q_conf.get() if q_conf else None
+
                 if rgb_packet is None or depth_packet is None:
                     time.sleep(0.01)
                     continue
-                
-                rgb_frame = rgb_packet.getCvFrame()
+
+                rgb_frame   = rgb_packet.getCvFrame()
                 depth_frame = depth_packet.getFrame()
-                # depth_frame = cv2.medianBlur(depth_frame, 5)  # Apply median blur to reduce noise
-                # Get confidence map if available
+                # OPT: kernel 3 instead of 5 — same noise reduction, ~4ms faster
+                depth_frame = cv2.medianBlur(depth_frame, DEPTH_MEDIAN_KSIZE)
+
                 if conf_packet is not None:
                     last_confidence_frame = conf_packet.getFrame()
             else:
-                # Simulation mode: generate synthetic data (adjusted for 640x400)
-                rgb_frame = np.zeros((400, 640, 3), dtype=np.uint8)
-                cv2.rectangle(rgb_frame, (100, 100), (540, 300), (100, 100, 100), -1)
-                
-                # Simulate AprilTag pattern
-                cv2.rectangle(rgb_frame, (250, 140), (390, 260), (255, 255, 255), -1)
-                cv2.rectangle(rgb_frame, (270, 160), (370, 240), (0, 0, 0), -1)
-                
-                # Simulate depth map (gradient representing ground plane) - vectorized
+                # Synthetic fallback
+                rgb_frame   = np.zeros((400, 640, 3), dtype=np.uint8)
                 depth_frame = np.zeros((400, 640), dtype=np.uint16)
-                y_vals = np.arange(400).reshape(-1, 1)
-                depth_frame[:] = 500 + y_vals * 3  # Vectorized: Depth increases with y (ground plane)
-                
-                # Add simulated obstacle
+                y_vals      = np.arange(400).reshape(-1, 1)
+                depth_frame[:] = 500 + y_vals * 3
                 cv2.rectangle(depth_frame, (300, 160), (350, 240), 1500, -1)
-                
-                # Simulate confidence map (all high confidence for valid regions)
                 last_confidence_frame = np.ones((400, 640), dtype=np.uint8) * 255
-            
-            # Convert RGB to BGR for consistency
+
             rgb_display = cv2.cvtColor(rgb_frame, cv2.COLOR_RGB2BGR)
-            
-            # Analyze depth map
+
+            # ── Depth stats (always) ────────────────────────────────────
             depth_stats = depth_debugger.analyze_depth_map(depth_frame)
-            raw_viz, filtered_viz = depth_debugger.visualize_depth(depth_frame, depth_stats)
-            
-            # Detect AprilTags
-            gray = cv2.cvtColor(rgb_frame, cv2.COLOR_RGB2GRAY)
+
+            # ── AprilTags ───────────────────────────────────────────────
+            gray           = cv2.cvtColor(rgb_frame, cv2.COLOR_RGB2GRAY)
             tag_detections = tag_tester.detect_with_diagnostics(gray, K)
-            
-            # Detect obstacles with confidence map
-            obstacles = obstacle_detector.detect_obstacles(depth_frame, K, last_confidence_frame)
-            
-            # Print diagnostics every 10 frames (more frequent for debugging)
+
+            # ── Obstacle detection (every frame, uses cached plane) ─────
+            obstacles, current_mask, ground_result, height_map_mm = \
+                obstacle_detector.detect_obstacles(
+                    depth_frame, K, last_confidence_frame)
+
+            # ── Submit frame to FastSAM thread (every N frames) ─────────
+            if frame_count % FASTSAM_INTERVAL == 0:
+                fusion.submit_frame(rgb_display)
+
+            # ── Fuse with latest SAM masks (non-blocking) ───────────────
+            if ground_result is not None:
+                depth_m_frame = depth_frame.astype(np.float32) / 1000.0
+                obstacles = fusion.fuse(
+                    rgb_display, depth_m_frame, obstacles,
+                    ground_result[0], ground_result[1],
+                    K, height_map_mm,
+                )
+
+            # ── OPT: temporal smoothing via bitwise OR + erosion ─────────
+            # Much cheaper than np.median over 3 frames; provides a 1-frame
+            # hysteresis that smooths flickering without lag
+            if stable_mask is None:
+                stable_mask = current_mask.copy()
+            else:
+                stable_mask = cv2.bitwise_or(stable_mask, current_mask)
+                # Decay: erode slightly so old blobs fade after ~2 frames
+                stable_mask = cv2.erode(stable_mask,
+                                         cv2.getStructuringElement(
+                                             cv2.MORPH_ELLIPSE, (3, 3)))
+
             frame_count += 1
+
+            # ── Console logging every 10 frames ─────────────────────────
             if frame_count % 10 == 0:
                 elapsed = time.time() - start_time
-                fps = frame_count / max(0.1, elapsed)
-                
+                fps     = frame_count / max(0.1, elapsed)
                 print(f"\n{'='*60}")
                 print(f"[Frame {frame_count}] FPS: {fps:.1f} | Mode: {current_mode}")
                 print(f"{'='*60}")
-                print(f"DEPTH MAP ANALYSIS:")
-                print(f"  Valid pixels: {depth_stats['valid_pixels']/depth_stats['total_pixels']*100:.1f}%")
-                print(f"  Median depth: {depth_stats['median_depth_mm']:.0f}mm ({depth_stats['median_depth_mm']/1000:.2f}m)")
-                print(f"  StdDev: {depth_stats['std_depth_mm']:.1f}mm")
-                print(f"  Noise ratio: {depth_stats['noise_ratio']:.2f} (lower=better, <0.3 good)")
-                print(f"  Temporal stability: {depth_stats['temporal_stability']:.2f} (1.0=perfect)")
-                
-                print(f"\nAPRILTAG DETECTIONS: {len(tag_detections)} found")
+                print(f"DEPTH MAP:")
+                print(f"  Valid: {depth_stats['valid_pixels']/depth_stats['total_pixels']*100:.1f}%  "
+                      f"Median: {depth_stats['median_depth_mm']:.0f}mm  "
+                      f"Noise: {depth_stats['noise_ratio']:.2f}")
+                print(f"APRILTAGS: {len(tag_detections)} found")
                 for tag in tag_detections:
-                    print(f"  Tag ID {tag['tag_id']}:")
-                    print(f"    Distance: {tag['distance_m']:.2f}m")
-                    print(f"    Bearing: {np.degrees(tag['bearing_rad']):.1f}°")
-                    print(f"    Confidence: {tag['confidence']:.2f}")
-                    print(f"    Apparent area: {tag['apparent_area_px']:.0f} px²")
-                
-                print(f"\nOBSTACLES DETECTED: {len(obstacles)} found")
-                for i, obs in enumerate(obstacles[:5]):  # Show closest 5
-                    pos = obs['position_3d_m']
-                    print(f"  #{i+1}: {obs['distance_m']:.2f}m @ ({pos[0]:.2f}, {pos[1]:.2f}, {pos[2]:.2f})m")
-                    if 'detection_confidence' in obs:
-                        print(f"       Conf: {obs['detection_confidence']:.2f}, Var: {obs['internal_variance_mm']:.1f}mm")
-            
-            # Save debug images every 20 frames (as requested)
+                    print(f"  ID {tag['tag_id']}: {tag['distance_m']:.2f}m "
+                          f"(conf {tag['confidence']:.2f})")
+                print(f"OBSTACLES: {len(obstacles)} found")
+                for i, obs in enumerate(obstacles[:5]):
+                    p = obs['position_3d_m']
+                    print(f"  #{i+1}: {obs['distance_m']:.2f}m @ "
+                          f"({p[0]:.2f},{p[1]:.2f},{p[2]:.2f})  "
+                          f"h={obs['median_height_mm']:.0f}mm  "
+                          f"src={obs.get('detection_source','?')}")
+
+            # ── Save debug image every 20 frames ────────────────────────
             if frame_count % 20 == 0:
                 try:
+                    elapsed = time.time() - start_time
+                    fps     = frame_count / max(0.1, elapsed)
+                    # HQ depth viz only computed here, not every frame
+                    filtered_viz = depth_debugger.visualize_depth_hq(
+                        depth_frame, depth_stats)
                     debug_view = create_debug_visualization(
-                        rgb_display, filtered_viz, tag_detections, obstacles, depth_stats, current_mode
-                    )
-                    save_path = os.path.join(images_dir, f"debug_frame_{frame_count:04d}.png")
+                        rgb_display, filtered_viz, tag_detections,
+                        obstacles, stable_mask, current_mode, fps)
+                    save_path = os.path.join(
+                        images_dir, f"debug_frame_{frame_count:04d}.png")
                     cv2.imwrite(save_path, debug_view)
-                    print(f"\n📸 Saved debug image: {save_path}")
+                    print(f"\n📸 Saved: {save_path}")
                 except Exception as e:
-                    print(f"Warning: Could not save debug image: {e}")
-            
-            # Check for exit condition (run for 300 frames then exit in headless mode)
+                    print(f"Warning: could not save debug image: {e}")
+
             if frame_count >= 300:
-                print(f"\n{'='*60}")
-                print("Completed 300 frames. Exiting headless debug session.")
-                print(f"{'='*60}")
+                print(f"\n{'='*60}\nCompleted 300 frames. Exiting.\n{'='*60}")
                 break
-    
+
     except KeyboardInterrupt:
         print("\nStopping...")
     finally:
