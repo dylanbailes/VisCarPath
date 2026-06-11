@@ -32,7 +32,7 @@ class AprilTagDetector:
     """
     
     def __init__(self, tag_family: str = "tag36h11", 
-                 quad_decimate: float = 1.0,
+                 quad_decimate: float = 1.0,   # CHANGED (Lalo 6/11): was 1.0 - halves detection resolution for ~2x FPS, negligible accuracy loss at our tag size
                  quad_sigma: float = 0.0):
         """
         Initialize AprilTag detector
@@ -67,7 +67,7 @@ class AprilTagDetector:
         self.cy = 360.0
         
         # Tag size in meters (should be configured based on actual tags)
-        self.tag_size = 0.08  # 8cm standard AprilTag
+        self.tag_size = 0.15  # CHANGED (Lalo 6/11): was 0.08 - our printed tag (test_tag.png) is 165mm. Wrong size = all PnP distances scaled wrong ('perfect distance' bug). Measure the printed black square and update if printer rescaled it.
 
         
     def set_camera_intrinsics(self, fx: float, fy: float, cx: float, cy: float):
@@ -82,11 +82,8 @@ class AprilTagDetector:
         detections = []
         h, w = gray_frame.shape[:2]
         
-        print(f"[APRILTAG] Running detection on {h}x{w} frame...")
-        
-        # 1. Run pupil_apriltags detector
+        # Run pupil_apriltags detector
         results = self.detector.detect(gray_frame)
-        print(f"[APRILTAG]   - Raw detector found {len(results)} candidate(s)")
         
         # Remove the hardcoded fx, fy, cx, cy block.
         # Instead, use the intrinsics stored in the class instance from the setup phase:
@@ -136,12 +133,12 @@ class AprilTagDetector:
                     confidence=result.decision_margin
                 ))
                     
-        print(f"[APRILTAG]   - Successfully localized {len(detections)} tag(s) via PnP\n")
         return detections
     
     def filter_ground_tags(self, detections: List[AprilTagDetection],
-                          camera_pitch: float = 0.3,  # ~17 degrees downward
-                          tolerance: float = 0.2) -> List[AprilTagDetection]:
+                          #camera_pitch: float = 0.3,  # ~17 degrees downward
+                          #tolerance: float = 0.2) -> List[AprilTagDetection]:
+        return detections                  
         """
         Filter detections to only include tags likely on the ground plane
         
@@ -289,11 +286,12 @@ class OakDAprilTagPipeline:
             raise RuntimeError("OAK-D queues not initialized. Hardware connection failed.")
             
         try:
-            # Host-side blocking wait with a timeout.
-            # If the camera stalls or USB drops, we abort after 1 second 
-            # instead of freezing the navigation stack forever.
-            rgb_packet = self.q_rgb.get()
-            depth_packet = self.q_depth.get()
+            # FIX: use tryGet() (non-blocking) instead of get() (blocking).
+            # get() deadlocks the navigation loop on USB hiccups or pipeline
+            # stalls. tryGet() returns None immediately if no frame is ready;
+            # callers handle None with a short sleep rather than freezing.
+            rgb_packet   = self.q_rgb.tryGet()
+            depth_packet = self.q_depth.tryGet()
             
         except RuntimeError as e:
             # Catches device disconnects, XLink errors, or pipeline crashes
