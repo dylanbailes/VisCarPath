@@ -67,7 +67,7 @@ class AprilTagDetector:
         self.cy = 360.0
         
         # Tag size in meters (should be configured based on actual tags)
-        self.tag_size = 0.15  # CHANGED (Lalo 6/11): was 0.08 - our printed tag (test_tag.png) is 165mm. Wrong size = all PnP distances scaled wrong ('perfect distance' bug). Measure the printed black square and update if printer rescaled it.
+        self.tag_size = 0.183  # CHANGED (Lalo 6/11): was 0.08 - our printed tag (test_tag.png) is 165mm. Wrong size = all PnP distances scaled wrong ('perfect distance' bug). Measure the printed black square and update if printer rescaled it.
 
         
     def set_camera_intrinsics(self, fx: float, fy: float, cx: float, cy: float):
@@ -136,41 +136,30 @@ class AprilTagDetector:
         return detections
     
     def filter_ground_tags(self, detections: List[AprilTagDetection],
-                          #camera_pitch: float = 0.3,  # ~17 degrees downward
-                          #tolerance: float = 0.2) -> List[AprilTagDetection]:
-        return detections                  
-        """
-        Filter detections to only include tags likely on the ground plane
-        
-        Args:
-            detections: List of all detected tags
-            camera_pitch: Expected camera pitch angle (radians, positive = looking down)
-            tolerance: Angular tolerance for ground plane classification
-            
-        Returns:
-            Filtered list of ground-level tags
-        """
+                          camera_pitch: float = 0.3,  # ~17 degrees downward
+                          tolerance: float = 0.2) -> List[AprilTagDetection]:                  
+
         ground_tags = []
-        
-        for det in detections:
-            # Extract tag position in camera frame
-            tag_pos = det.pose[:3, 3]
+        ground_tags = detections
+        # for det in detections:
+        #     # Extract tag position in camera frame
+        #     tag_pos = det.pose[:3, 3]
             
-            # For a ground-mounted tag, the normal should point upward
-            # Tag coordinate system: Z points out of tag, so for ground tag Z should point up
-            tag_normal_cam = det.pose[:3, 2]  # Tag Z-axis in camera frame
+        #     # For a ground-mounted tag, the normal should point upward
+        #     # Tag coordinate system: Z points out of tag, so for ground tag Z should point up
+        #     tag_normal_cam = det.pose[:3, 2]  # Tag Z-axis in camera frame
             
-            # Expected ground normal in camera frame (pointing up)
-            # If camera is pitched down by camera_pitch, ground normal rotates
-            expected_normal = np.array([0, np.sin(camera_pitch), np.cos(camera_pitch)])
+        #     # Expected ground normal in camera frame (pointing up)
+        #     # If camera is pitched down by camera_pitch, ground normal rotates
+        #     expected_normal = np.array([0, np.sin(camera_pitch), np.cos(camera_pitch)])
             
-            # Check if tag normal aligns with expected ground normal
-            dot_product = np.dot(tag_normal_cam, expected_normal)
+        #     # Check if tag normal aligns with expected ground normal
+        #     dot_product = np.dot(tag_normal_cam, expected_normal)
             
-            # Tags on ground should have normals pointing roughly toward camera (dot > 0)
-            # and aligned with expected ground plane
-            if dot_product > np.cos(tolerance):
-                ground_tags.append(det)
+        #     # Tags on ground should have normals pointing roughly toward camera (dot > 0)
+        #     # and aligned with expected ground plane
+        #     if dot_product > np.cos(tolerance):
+        #         ground_tags.append(det)
         
         return ground_tags
 
